@@ -1,0 +1,65 @@
+# Example run config for the 2P preprocessing pipeline.
+#
+# A single config can drive BOTH stages:
+#   python run_suite2p.py --config configs/example_run.yaml
+#   python compute_dff.py  --config configs/example_run.yaml
+#
+# Copy this file, rename it per experiment, and edit the values. Nothing in the
+# Python scripts needs to change.
+
+# --- Who / what to process -------------------------------------------------
+experimenter: RD                 # initials, mapped to a folder via experimenter_map
+mice: [RD116, RD119, RD121]      # mice to process
+on_haas: true                    # true -> HAAS cluster mounts; false -> lab server
+
+# --- run_suite2p.py options ------------------------------------------------
+longitudinal: false              # true: concatenate all sessions, one run per mouse
+start_date: "20260610"           # skip sessions before this date (null to disable)
+session_to_do: null              # process only this exact session id (null = all)
+excluded_sessions:
+  - RD121_20260428_115902
+  - RD116_20260507_094904
+
+# Overrides layered on top of suite2p.default_settings(). Only list what you
+# change; nested keys (registration, detection, io) are merged, not replaced.
+suite2p_ops:
+  fs: 30
+  tau: 0.1                       # GCaMP8s timescale for deconvolution
+  io:
+    delete_bin: false
+  registration:
+    batch_size: 500
+    nimg_init: 400
+    reg_tif: true                # save registered tif for Fissa / NWB
+  detection:
+    threshold_scaling: 0.9
+    sparsery_settings:
+      max_ROIs: 1000
+
+# --- compute_dff.py options ------------------------------------------------
+dff:
+  neuropil_coeff: 0.7            # F_cor = F_raw - neuropil_coeff * F_neu
+  window: 30                    # baseline window (s) on each side of a sample
+  sigma_win: 5                  # gaussian smoothing of the baseline (s)
+  overwrite: false              # recompute even if dff.npy already exists
+
+# --- Folder layout (defaults match the LSENS convention) -------------------
+# Change these only if your data is organised differently.
+folder_layout:
+  imaging_subpath: [Recording, Imaging]   # <data_root>/<mouse>/Recording/Imaging/<session>
+  suite2p_subpath: [suite2p, plane0]       # <analysis>/<mouse>/<session>/suite2p/plane0
+  session_date_format: "%Y%m%d"            # parsed from session_id.split('_')[1]
+
+# --- Storage roots (optional) ----------------------------------------------
+# Uncomment to point at a different server / local copy. Defaults are the
+# LSENS lab server and HAAS mounts defined in config.py.
+# paths:
+#   data_root: "//sv-nas1.rcp.epfl.ch/Petersen-Lab/data"
+#   data_root_haas: "/mnt/lsens-data"
+#   analysis_root: "//sv-nas1.rcp.epfl.ch/Petersen-Lab/analysis"
+#   analysis_root_haas: "/mnt/lsens-analysis"
+
+# --- Extra experimenters (optional) ----------------------------------------
+# Add lab members not already in config.py's EXPERIMENTER_MAP.
+# experimenter_map:
+#   XY: Firstname_Lastname
