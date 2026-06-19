@@ -16,17 +16,54 @@ from PyQt5 import QtWidgets, uic
 from PyQt5.QtCore import QCoreApplication
 from PyQt5.QtWidgets import QApplication, QComboBox, QLabel, QMainWindow
 
+# Import the shared config helpers from the parent imaging_preprocessing folder
+# (flat-script layout: add it to sys.path rather than packaging).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config import (  # noqa: E402
+    get_data_folder,
+    get_experimenter_analysis_folder,
+    load_config,
+)
 
-mouse_list = ['RD121']  # RD109, RD116, RD119, RD121
-mouse_session_list = []
-rt_p = f'\\\\sv-nas1.rcp.epfl.ch\\Petersen-Lab\\analysis\\Robin_Dard\\data'
-for mouse in mouse_list:
-    for sess in os.listdir(os.path.join(rt_p, mouse)):
-        if not os.path.exists(os.path.join(rt_p, mouse, sess, 'suite2p')):
+
+def _load_gui_config():
+    """Load the GUI config: first .yaml on the command line, else the example."""
+    cfg_path = next((a for a in sys.argv[1:] if a.endswith(('.yaml', '.yml'))), None)
+    if cfg_path is None:
+        cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                'configs', 'example_gui.yaml')
+    return load_config(cfg_path)
+
+
+def _build_session_list(analysis_root, mice, output_subdir):
+    """Sessions that have a suite2p output but no projection labels yet."""
+    sessions = []
+    for mouse in mice:
+        mouse_dir = os.path.join(analysis_root, mouse)
+        if not os.path.isdir(mouse_dir):
             continue
-        if not os.path.exists(os.path.join(rt_p, mouse, sess, 'projection_neurons')):
-            mouse_session_list.append(sess)
-mouse_session_list = natsorted(mouse_session_list)
+        for sess in os.listdir(mouse_dir):
+            if not os.path.exists(os.path.join(mouse_dir, sess, 'suite2p')):
+                continue
+            if not os.path.exists(os.path.join(mouse_dir, sess, output_subdir)):
+                sessions.append(sess)
+    return natsorted(sessions)
+
+
+# --- Config-driven globals (replace the old hardcoded mouse_list / rt_p) -----
+CONFIG = _load_gui_config()
+GUI_CFG = CONFIG.get('projection_gui') or {}
+ON_HAAS = CONFIG.get('on_haas', False)
+OUTPUT_SUBDIR = GUI_CFG.get('output_subdir', 'projection_neurons')
+
+# Analysis root (suite2p outputs + saved labels) and data root (projection tiffs).
+ANALYSIS_ROOT = get_experimenter_analysis_folder(
+    CONFIG['experimenter'], ON_HAAS, CONFIG.get('paths'),
+    CONFIG.get('experimenter_map'))
+DATA_ROOT = get_data_folder(ON_HAAS, CONFIG.get('paths'))
+
+mouse_list = list(CONFIG['mice'])
+mouse_session_list = _build_session_list(ANALYSIS_ROOT, mouse_list, OUTPUT_SUBDIR)
 
 class ProjectionsGUI(QMainWindow):  
 
@@ -44,7 +81,7 @@ class ProjectionsGUI(QMainWindow):
         pg.setConfigOption('background', 'w')
         pg.setConfigOption('foreground', 'k')
 
-        self.server_dir = '\\\\sv-nas1.rcp.epfl.ch\\Petersen-Lab\\analysis\\Robin_Dard\\data'
+        self.server_dir = ANALYSIS_ROOT
         mouse_list_unique = list(set(mouse_list))
         mouse_session_list_unique = natsorted(list(set(mouse_session_list)))
 
@@ -152,13 +189,16 @@ class ProjectionsGUI(QMainWindow):
             print(self.sessionkey)
             print(self.sessionnamekey)
 
-            self.server_dir = pathlib.Path(os.path.join(self.server_dir, choiceMouse, choiceSession))
+            # Always rebuild from the stable analysis root so repeated
+            # selections don't nest mouse/session paths.
+            self.server_dir = pathlib.Path(ANALYSIS_ROOT) / choiceMouse / choiceSession
 
             if not(self.server_dir.is_dir()):
                 print('Folder created!')
                 os.makedirs(self.server_dir)
 
-            suite2p_folder = f'\\\\sv-nas1.rcp.epfl.ch\\Petersen-Lab\\analysis\\Robin_Dard\\data\\{choiceMouse}\\{choiceSession}\\suite2p\\plane0'
+            suite2p_subpath = GUI_CFG.get('suite2p_subpath', ['suite2p', 'plane0'])
+            suite2p_folder = os.path.join(self.server_dir, *suite2p_subpath)
             self.stat = np.load(os.path.join(suite2p_folder, 'stat.npy'), allow_pickle=True)
             self.ops = np.load(os.path.join(suite2p_folder, 'ops.npy'), allow_pickle=True).item()
             self.iscell = np.load(os.path.join(suite2p_folder, 'iscell.npy'), allow_pickle=True)
@@ -183,9 +223,9 @@ class ProjectionsGUI(QMainWindow):
 
         #check if files already exist
 
-        self.CheckRedFile =  pathlib.Path(os.path.join(self.server_dir, 'projection_neurons', "RedRois.npy"))
-        self.CheckFarRedFile =  pathlib.Path(os.path.join(self.server_dir, 'projection_neurons', "FarRedRois.npy"))
-        self.CheckUNFile =  pathlib.Path(os.path.join(self.server_dir, 'projection_neurons', "UNRois.npy"))
+        self.CheckRedFile =  pathlib.Path(os.path.join(self.server_dir, OUTPUT_SUBDIR, "RedRois.npy"))
+        self.CheckFarRedFile =  pathlib.Path(os.path.join(self.server_dir, OUTPUT_SUBDIR, "FarRedRois.npy"))
+        self.CheckUNFile =  pathlib.Path(os.path.join(self.server_dir, OUTPUT_SUBDIR, "UNRois.npy"))
 
         if not(self.CheckRedFile.is_file()) or not(self.CheckFarRedFile.is_file()) or not(self.CheckUNFile.is_file()):
             (self.Far_red, self.Red, self.UN) =  self.predefineRois()
@@ -803,8 +843,12 @@ class ProjectionsGUI(QMainWindow):
 
         mouse_name = self.sessionkey['mouse_name']
         session_name = self.sessionnamekey['session_name']
-        projection_path = (f'\\\\sv-nas1.rcp.epfl.ch\\Petersen-Lab\\data\\{mouse_name}\\Recording\\'
-                           f'projection_neurons\\{session_name}_projections')
+        # <data_root>/<mouse>/Recording/projection_neurons/<session>_projections
+        projection_subpath = GUI_CFG.get('projection_subpath',
+                                         ['Recording', 'projection_neurons'])
+        projection_suffix = GUI_CFG.get('projection_suffix', '_projections')
+        projection_path = os.path.join(DATA_ROOT, mouse_name, *projection_subpath,
+                                       f'{session_name}{projection_suffix}')
         images = os.listdir(projection_path)
 
         def _find_img(tag):
@@ -816,10 +860,12 @@ class ProjectionsGUI(QMainWindow):
                 stack = reader.data()
             return stack.mean(axis=0).astype(stack.dtype) if stack.ndim == 3 else stack
 
-        baseline_img = _find_img('gcamp')
-        ctb_img_farred = _find_img('_FR')
-        ctb_img_red = _find_img('ctb')
-        red_reg_img = _find_img('_R2')
+        # Substrings that identify each channel's tiff in the projection folder.
+        tags = GUI_CFG.get('channel_tags', {})
+        baseline_img = _find_img(tags.get('baseline', 'gcamp'))
+        ctb_img_farred = _find_img(tags.get('ctb_farred', '_FR'))
+        ctb_img_red = _find_img(tags.get('ctb_red', 'ctb'))
+        red_reg_img = _find_img(tags.get('red_reg', '_R2'))
 
         _ref = next((im for im in [baseline_img, ctb_img_farred, ctb_img_red, red_reg_img] if im is not None), None)
         _black = np.zeros(_ref.shape if _ref is not None else (512, 512), dtype=np.uint16)
@@ -847,11 +893,13 @@ class ProjectionsGUI(QMainWindow):
         colorImgRed1Moving= sitk.GetImageFromArray(ctbImgRedNorm)
         colorImgFarRedMoving = sitk.GetImageFromArray(ctbImgFarRedNorm)
 
+        reg_map_type = GUI_CFG.get('registration_parameter_map', 'affine')
+
         #register the two red images (R1 and R2)
         elastixImageFilter = sitk.ElastixImageFilter()
         elastixImageFilter.SetFixedImage(colorImgRed2Fixed)
         elastixImageFilter.SetMovingImage(colorImgRed1Moving)
-        elastixImageFilter.SetParameterMap(sitk.GetDefaultParameterMap("affine"))
+        elastixImageFilter.SetParameterMap(sitk.GetDefaultParameterMap(reg_map_type))
         elastixImageFilter.Execute()
 
         # get transformed red image and transformation (registering the R1 to R2)
@@ -867,7 +915,7 @@ class ProjectionsGUI(QMainWindow):
         elastixImageFilter = sitk.ElastixImageFilter()
         elastixImageFilter.SetFixedImage(colorImgGreenImgFixed)
         elastixImageFilter.SetMovingImage(colorImgGreenImgMoving)
-        elastixImageFilter.SetParameterMap(sitk.GetDefaultParameterMap("affine"))
+        elastixImageFilter.SetParameterMap(sitk.GetDefaultParameterMap(reg_map_type))
         elastixImageFilter.Execute()
 
         # get transformed green image and transformation matrix
@@ -880,9 +928,6 @@ class ProjectionsGUI(QMainWindow):
         transformedctbImgRedArray = sitk.GetArrayFromImage(transformedctbImgRed)
         transformedctbImgFarRed = sitk.Transformix(transformedOnceImgFarRed, transformParameterMapVector)
         transformedctbImgFarRedArray = sitk.GetArrayFromImage(transformedctbImgFarRed)
-
-        #sitk.WriteImage(transformedctbImgRed, "C:\\Users\\foustouk\\Desktop\\test\\R.tif")
-        #sitk.WriteImage(transformedctbImgFarRed, "C:\\Users\\foustouk\\Desktop\\test\\FR.tif")
 
         transformedctbImgRedArrayNorm =  cv2.normalize(src=transformedctbImgRedArray, dst=None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8U)
         transformedctbImgFarRedArrayNorm =  cv2.normalize(src=transformedctbImgFarRedArray, dst=None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8U)

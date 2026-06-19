@@ -1,280 +1,273 @@
+"""Reusable helpers for fixing / stitching imaging-session recordings.
+
+This file used to be a scratchpad of one-off corrections (specific mice, hard
+coded server paths). Those operations actually reuse a small set of verbs, which
+are now exposed as documented functions so any session can be fixed without
+editing code:
+
+  * reading ``log_continuous.bin`` and pulling out its interleaved channels,
+  * detecting imaging-frame / trial / camera events,
+  * truncating a log at a sample (e.g. an accidental extra recording),
+  * stitching two split sessions (logs + behaviour tables),
+  * counting / truncating / merging imaging tiffs and behaviour-camera avis.
+
+``cv2`` and ``ScanImageTiffReader`` are imported lazily inside the functions that
+need them, so importing this module never requires them.
+
+Channel layout of log_continuous.bin
+-------------------------------------
+The binary is a flat float64 array of ``N_LOG_CHANNELS`` interleaved analog
+channels sampled at ``LOG_SAMPLING_RATE`` Hz. Channel ``i`` is ``log[i::6]``.
+The defaults below match the LSENS rig; override via ``LOG_CHANNELS`` if your
+wiring differs.
+
+Example: stitch two split sessions
+----------------------------------
+    log1 = read_log('.../sess1/log_continuous.bin')
+    log2 = read_log('.../sess2/log_continuous.bin')
+    merged = stitch_logs(log1, log2)            # optionally trim_end1=12000
+    write_log(merged, '.../corrected/log_continuous.bin')
+
+    import pandas as pd
+    df1 = pd.read_csv('.../sess1/results.csv')
+    df2 = pd.read_csv('.../sess2/results.csv')
+    full = stitch_behavior(df1, df2, part1_duration_s=log_duration_s(log1))
+    full.to_csv('.../corrected/results.csv', index=False)
+
+Example: cut an accidental over-recording at the last trial
+-----------------------------------------------------------
+    log = read_log(path)
+    starts = detect_trial_starts(log)
+    cut = starts[-1] + 6 * LOG_SAMPLING_RATE     # 6 s after last trial start
+    write_log(truncate_log(log, cut), out_path)
+"""
+
+import argparse
 import os
 
 import numpy as np
-import matplotlib.pyplot as plt
-from ScanImageTiffReader import ScanImageTiffReader
 from scipy.signal import find_peaks
-import tifffile as tiff
-import pandas as pd
-import matplotlib
-matplotlib.use('TkAgg')
 
 
-# Log continuous.
-# ###############
+# --- Log format constants --------------------------------------------------
+LOG_SAMPLING_RATE = 5000   # Hz
+N_LOG_CHANNELS = 6
 
-path = r'\\sv-nas1.rcp.epfl.ch\Petersen-Lab\analysis\Mauro_Pulin\Data_all\Behavior\MP105'
-
-log1 = np.fromfile(os.path.join(path, 'MP105_20260505_122338', 'log_continuous.bin'))
-log2 = np.fromfile(os.path.join(path, 'MP105_20260505_130102', 'log_continuous.bin'))
-
-# Log1 end & Log2 start
-log1_end = log1[-5000 * 20 * 6:]
-log2_start = log2[:5000 * 20 * 6]
-log1_ts = np.arange(0, np.round(len(log1) / 6)) / 5000
-log2_ts = np.arange(0, np.round(len(log2) / 6)) / 5000
-
-# Plot
-fig, axes = plt.subplots(6, 2, figsize=(15, 8))
-for i in range(6):
-    axes[i, 0].plot(log1_ts[-5000 * 20:], log1_end[i::6])
-    axes[i, 1].plot(log2_ts[:5000 * 20], log2_start[i::6])
-fig.tight_layout()
-
-# First bhv session end
-bhv_df_1 = pd.read_csv(os.path.join(path, 'MP105_20260505_122338', 'results.csv'))
-bhv_df_2 = pd.read_csv(os.path.join(path, 'MP105_20260505_130102', 'results.csv'))
-
-# Check timestamps
-print('\nSession 1: ')
-print(f'last trial : {bhv_df_1.trial_time.values[-1]}, perf : {bhv_df_1.perf.values[-1]}')
-print('\nSession 2: ')
-print(f'last trial : {bhv_df_2.trial_time.values[0]}, perf : {bhv_df_1.perf.values[0]}')
-
-# Stitching (Matlab crashes, nothing to remove at the end of part 1)
-log_corrected = np.concatenate((log1, log2))
-save_path = r'\\sv-nas1.rcp.epfl.ch\Petersen-Lab\share_internal\Mauro_Pulin\From_robin\MP105\corrected'
-os.makedirs(save_path, exist_ok=True)
-with open(os.path.join(save_path, 'log_continuous.bin'), mode='wb') as fid:
-    log_corrected.tofile(fid)
-
-# Fix trial-time in second behavior table
-part1_ending_time = np.round(len(log1) / 6) / 5000
-n_trials_part1 = max(bhv_df_1.trial_number)
-bhv_df_2['trial_time'] = bhv_df_2['trial_time'] + part1_ending_time
-bhv_df_2['trial_number'] = bhv_df_2['trial_number'] + n_trials_part1
-
-full_bhv = pd.concat([bhv_df_1, bhv_df_2])
-full_bhv = full_bhv.reset_index(drop=True)
-full_bhv.to_csv(os.path.join(save_path, 'results.csv'))
+# Logical channel name -> interleave index into the flat log array.
+LOG_CHANNELS = {
+    'galvo': 1,     # imaging-frame (galvo) pulses -> one peak per imaging frame
+    'trial': 2,     # trial-start TTL (thresholded > 2 V)
+    'camera': 3,    # behaviour-camera frame pulses
+}
 
 
-fig.savefig(os.path.join(save_path, 'fig.png'))
+# --- Reading / writing logs ------------------------------------------------
+def read_log(path):
+    """Read a ``log_continuous.bin`` file into a flat float64 array."""
+    return np.fromfile(path)
 
 
-# ---------------------------------------------------------------------------------------------------------------------
-# Cut last ttl up from first session due to stopping, fuse and save.
-log = np.concatenate([log1[:-12000], log2])
-
-save_path = os.path.join(path, 'corrected')
-with open(os.path.join(save_path, 'log_continuous.bin'), mode='wb') as fid:
-    log.tofile(fid)
+def write_log(log, path):
+    """Write a log array back to a binary file (creates parent dirs)."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, mode='wb') as fid:
+        log.tofile(fid)
 
 
-path = r'\\sv-nas1.rcp.epfl.ch\Petersen-Lab\analysis\Anthony_Renard\log_continuous.bin'
-log_bad = np.fromfile(path)
-log_bad = log_bad[::6]
-log_bad = np.abs(log_bad)
+def log_channel(log, channel, n_channels=N_LOG_CHANNELS):
+    """Return one de-interleaved channel.
 
-path = r"\\sv-nas1.rcp.epfl.ch\Petersen-Lab\data\AR180\Training\AR180_20241214_194639\log_continuous.bin"
-log = np.fromfile(path)
-log = log[::6]
-log = np.abs(log)
+    ``channel`` may be an integer index or a key of :data:`LOG_CHANNELS`.
+    """
+    idx = LOG_CHANNELS[channel] if isinstance(channel, str) else channel
+    return log[idx::n_channels]
 
 
-path = r"\\sv-nas1.rcp.epfl.ch\Petersen-Lab\data\AR176\Training\AR176_20241215_160714\log_continuous.bin"
-log = np.fromfile(path)
+def log_duration_s(log, fs=LOG_SAMPLING_RATE, n_channels=N_LOG_CHANNELS):
+    """Duration of a log in seconds."""
+    return np.round(len(log) / n_channels) / fs
 
 
-log2 = log[1::6]
-
-plt.plot(log2[-5000*60*20:-5000*60*10])
-log2_cor = np.copy(log2)
-log2_cor[-5000*60*20+860000:-5000*60*20+910000] = 0.65
-plt.plot(log2_cor[-5000*60*20:-5000*60*10])
-
-log[1::6] = log2_cor
-log_check = log[1::6]
-plt.plot(log_check[-5000*60*20:-5000*60*10:6])
-
-save_path = '\\\\sv-nas1.rcp.epfl.ch\\Petersen-Lab\\analysis\\Anthony_Renard\\need_fix\\AR176\\Training\\AR176_20241215_160714_cor\\log_continuous.bin'
-with open(save_path, mode='wb') as fid:
-    log.tofile(fid)
+# --- Event detection -------------------------------------------------------
+def detect_galvo_frames(log, distance=100, prominence=1):
+    """Sample indices of imaging-frame (galvo) pulses."""
+    return find_peaks(log_channel(log, 'galvo'),
+                      distance=distance, prominence=prominence)[0]
 
 
-91440
-157900
+def detect_camera_frames(log, distance=10, prominence=1):
+    """Sample indices of behaviour-camera frame pulses."""
+    return find_peaks(log_channel(log, 'camera'),
+                      distance=distance, prominence=prominence)[0]
 
 
+def detect_trial_starts(log, threshold=2.0, distance=100, prominence=1):
+    """Sample indices of trial-start TTL rising edges."""
+    ttl = log_channel(log, 'trial')
+    rising = (ttl > threshold)[1:].astype(np.float64) - (ttl > threshold)[:-1].astype(np.float64)
+    return find_peaks(rising, distance=distance, prominence=prominence)[0]
 
-# Merging movies.
-# ###############
 
-# movies1 = ["D:\\AR\\AR129 24-03-01 13-28-58.avi", 'D:\\AR\\AR129 24-03-03 15-25-39.avi']
-# movies2 = ["D:\\AR\\AR129 24-03-01 14-28-27.avi", 'D:\\AR\\AR129 24-03-03 16-10-25.avi']
-# save_paths = ['D:\\AR\\AR129 24-03-01 13-28-58_merged.avi',
-#               'D:\\AR\\AR129 24-03-03 15-25-39_merged.avi']
+# --- Log editing -----------------------------------------------------------
+def truncate_log(log, cut_sample, n_channels=N_LOG_CHANNELS):
+    """Return a copy of ``log`` with every channel zeroed after ``cut_sample``.
 
-movie1 = "D:\\AR\\AR129 24-03-03 15-25-39.avi"
-movie2 = "D:\\AR\\AR129 24-03-03 16-10-25.avi"
-save_path = 'D:\\AR\\AR129 24-03-03 15-25-39_merged.avi'
+    ``cut_sample`` is an index into a single de-interleaved channel.
+    """
+    out = np.copy(log)
+    for i in range(n_channels):
+        out[i::n_channels][cut_sample:] = 0
+    return out
 
-videofiles = [movie1, movie2]
 
-video_index = 0
-cap = cv2.VideoCapture(videofiles[0])
+def stitch_logs(log1, log2, trim_end1=0):
+    """Concatenate two logs, optionally dropping ``trim_end1`` samples (per
+    channel) from the end of the first (e.g. a stray TTL from stopping)."""
+    if trim_end1:
+        log1 = log1[:-trim_end1 * N_LOG_CHANNELS]
+    return np.concatenate([log1, log2])
 
-fourcc = cv2.VideoWriter_fourcc(*'Y800')
-out = cv2.VideoWriter(save_path, fourcc, 100.0, (640, 480))
-count_frame = 0
-while(cap.isOpened()):
-    ret, frame = cap.read()
-    # print(count_frame, end='\r')
-    # count_frame += 1
-    if frame is None:
-        print ("end of video " + str(video_index) + " .. next one now")
-        video_index += 1
-        if video_index >= len(videofiles):
-            break
-        cap = cv2.VideoCapture(videofiles[ video_index ])
+
+# --- Behaviour tables ------------------------------------------------------
+def stitch_behavior(df1, df2, part1_duration_s):
+    """Concatenate two behaviour tables, offsetting the second's trial time and
+    trial number so they continue after the first session."""
+    df2 = df2.copy()
+    n_trials_part1 = df1['trial_number'].max()
+    df2['trial_time'] = df2['trial_time'] + part1_duration_s
+    df2['trial_number'] = df2['trial_number'] + n_trials_part1
+    import pandas as pd
+    return pd.concat([df1, df2]).reset_index(drop=True)
+
+
+# --- Frame counting --------------------------------------------------------
+def count_tiff_frames(path):
+    """Number of frames in a single ScanImage tiff."""
+    from ScanImageTiffReader import ScanImageTiffReader
+    return ScanImageTiffReader(path).shape()[0]
+
+
+def count_tiff_frames_in_folder(folder, extensions=('.tif', '.tiff')):
+    """Total frames across all tiffs in a folder."""
+    total = 0
+    for name in os.listdir(folder):
+        if name.lower().endswith(extensions):
+            total += count_tiff_frames(os.path.join(folder, name))
+    return total
+
+
+def count_avi_frames(path):
+    """Number of frames reported by a behaviour-camera avi."""
+    import cv2
+    cap = cv2.VideoCapture(path)
+    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+    return n
+
+
+# --- Tiff / avi editing ----------------------------------------------------
+def truncate_tiff(in_path, out_path, drop_last):
+    """Write a copy of a tiff with the last ``drop_last`` frames removed."""
+    import tifffile
+    from ScanImageTiffReader import ScanImageTiffReader
+    data = ScanImageTiffReader(in_path).data()
+    if drop_last:
+        data = data[:-drop_last]
+    tifffile.imwrite(out_path, data)
+
+
+def truncate_avi(in_path, out_path, keep_frames, fps=100.0, size=(640, 480),
+                 fourcc='Y800'):
+    """Re-write an avi keeping only the first ``keep_frames`` frames."""
+    import cv2
+    cap = cv2.VideoCapture(in_path)
+    writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*fourcc), fps, size)
+    count = 0
+    while cap.isOpened() and count < keep_frames:
         ret, frame = cap.read()
-    # cv2.imshow('frame',frame)
-    out.write(frame)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
-
-cap.release()
-out.release()
-cv2.destroyAllWindows()
-
-print ("end.")
+        if frame is None:
+            break
+        writer.write(frame)
+        count += 1
+    cap.release()
+    writer.release()
+    return count
 
 
-# Solving mess with AR141.
-# ########################
-
-""" Solve the mess of pressing start instead of resume i.e. imaging continues while video filming and logging stops.
-The strategy is to find a tiume stamp in the log file which will be the end of the session -
-Take the end of the last logged trial - and delete the excess of imaging frame by
-rewritting the tiff; similarly for the avi file.
- """
-
-
-# read the log and determine final time stamp.
-
-log_1 = "\\\\sv-nas1.rcp.epfl.ch\\Petersen-Lab\\analysis\\Anthony_Renard\\need_fix\\AR141\\AR141_20240520\\training\\AR141_20240520_104531\\log_continuous.bin"
-log_1 = np.fromfile(log_1)
-ttl_events = find_peaks((log_1[2::6]>2)[1:].astype(np.float64) - (log_1[2::6]>2)[:-1].astype(np.float64), distance=100, prominence=1)[0]
-
-cut = ttl_events[-1] + 6 * 5000  # 6 sec after the last trial start.
-
-# plt.plot(log_1[3::6][23959394-5000*10:23959394+5000*60])
-# plt.plot(log_1[0::6][23959394-5000*10:23959394+5000*60])
-# plt.plot(log_1[1::6][23959394-5000*10:23959394+5000*60])
-# plt.plot(log_1[2::6][23959394-5000*10:23959394+5000*60])
-
-log_1_corrected = np.copy(log_1)
-for i in range(6):
-    log_1_corrected[i::6][cut:] = 0
-
-ttl_events_cor = find_peaks((log_1_corrected[2::6]>2)[1:].astype(np.float64) - (log_1_corrected[2::6]>2)[:-1].astype(np.float64), distance=100, prominence=1)[0]
-galvo_events_cor = find_peaks(log_1_corrected[1::6], distance=100, prominence=1)[0]
-cam_events_cor = find_peaks(log_1_corrected[3::6], distance=10, prominence=1)[0]
-
-# Checking.
-plt.plot(log_1_corrected[3::6])
-plt.scatter(cam_events_cor, log_1_corrected[3::6][cam_events_cor])
-plt.plot(log_1_corrected[0::6])
-plt.plot(log_1_corrected[1::6])
-plt.scatter(galvo_events_cor, log_1_corrected[1::6][galvo_events_cor])
-plt.plot(log_1_corrected[2::6])
-plt.scatter(ttl_events_cor, log_1_corrected[2::6][ttl_events_cor])
-
-n_frames_imaging = galvo_events_cor.size
-n_frames_filming = cam_events_cor.size
-
-save_path = '\\\\sv-nas1.rcp.epfl.ch\\Petersen-Lab\\analysis\\Anthony_Renard\\need_fix\\AR141\\AR141_20240520\\training\\AR141_20240520_104531\\log_continuous_1_cor.bin'
-with open(save_path, mode='wb') as fid:
-    log_1_corrected.tofile(fid)
+def merge_avis(in_paths, out_path, fps=100.0, size=(640, 480), fourcc='Y800'):
+    """Concatenate several avis into one (e.g. a split filming session)."""
+    import cv2
+    writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*fourcc), fps, size)
+    n = 0
+    for path in in_paths:
+        cap = cv2.VideoCapture(path)
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if frame is None:
+                break
+            writer.write(frame)
+            n += 1
+        cap.release()
+    writer.release()
+    return n
 
 
-# Count frames in CI movie.
-
-session_1_path = '\\\\sv-nas1.rcp.epfl.ch\\Petersen-Lab\\analysis\\Anthony_Renard\\need_fix\\AR141\\AR141_20240520\\AR141_20240520'
-tiff_list = os.listdir(session_1_path)
-
-nframes = 0 
-for tiff in tiff_list:
-    tiff = os.path.join(session_1_path, tiff)
-    nframes += ScanImageTiffReader(tiff).shape()[0]
-
-session_2_path = '\\\\sv-nas1.rcp.epfl.ch\\Petersen-Lab\\analysis\\Anthony_Renard\\need_fix\\AR141\\AR141_20240520\\AR141_20240520_2\\AR141_20240520_00004.tif'
-nframes_2 = ScanImageTiffReader(session_2_path).shape()[0]
+# --- Thin CLI for the most common operations -------------------------------
+def _cli_stitch_logs(args):
+    log1, log2 = read_log(args.log1), read_log(args.log2)
+    merged = stitch_logs(log1, log2, trim_end1=args.trim_end1)
+    write_log(merged, args.out)
+    print(f'Wrote {args.out} ({log_duration_s(merged):.1f} s).')
 
 
-# Count frames in avi.
-
-movie_1 = "\\\\sv-nas1.rcp.epfl.ch\\Petersen-Lab\\analysis\\Anthony_Renard\\need_fix\\AR141\\AR141_20240520\\filming\\AR141 24-05-20 10-44-32.avi"
-video_capture = cv2.VideoCapture(movie_1)
-video_length = int(video_capture.get(cv2.CAP_PROP_FRAME_COUNT))
-
-
-# Results:
-# n imaging frames in the first session 141495 the second one has 15315.
-# n imaging frames to keep: 139504 (in the first session)
-141495 - 139504
-# n filming frames in avi 430336
-# n frames to keep 425376
-
-# Rewrite these files
-
-movie1 = "\\\\sv-nas1.rcp.epfl.ch\\Petersen-Lab\\analysis\\Anthony_Renard\\need_fix\\AR141\\AR141_20240520\\filming\\AR141 24-05-20 10-44-32.avi"
-save_path = '\\\\sv-nas1.rcp.epfl.ch\\Petersen-Lab\\analysis\\Anthony_Renard\\need_fix\\AR141\\AR141_20240520\\filming\\AR141 24-05-20 10-44-32_cor.avi'
-
-video_index = 0
-cap = cv2.VideoCapture(movie1)
-
-fourcc = cv2.VideoWriter_fourcc(*'Y800')
-out = cv2.VideoWriter(save_path, fourcc, 100.0, (640, 480))
-count_frame = 0
-while(cap.isOpened()):
-    if count_frame > 430336:
-        break
+def _cli_truncate_log(args):
+    log = read_log(args.log)
+    if args.at_last_trial:
+        cut = detect_trial_starts(log)[-1] + args.post_trial_s * LOG_SAMPLING_RATE
     else:
-        print(f'frame {count_frame}/430336', end='\r')
-        ret, frame = cap.read()
-        out.write(frame)
-        count_frame += 1
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-cap.release()
-out.release()
-cv2.destroyAllWindows()
-print ("Fin.")
-
-# Count frames of corrected movie to check.
-movie_1 = '\\\\sv-nas1.rcp.epfl.ch\\Petersen-Lab\\analysis\\Anthony_Renard\\need_fix\\AR141\\AR141_20240520\\filming\\AR141 24-05-20 10-44-32_cor.avi'
-video_capture = cv2.VideoCapture(movie_1)
-video_length_cor = int(video_capture.get(cv2.CAP_PROP_FRAME_COUNT))
-
-# cut ci tiff
-
-read_path = '\\\\sv-nas1.rcp.epfl.ch\\Petersen-Lab\\analysis\\Anthony_Renard\\need_fix\\AR141\\AR141_20240520\\imaging\\AR141_20240520_1\\AR141_20240520_00003.tif'
-tiff = ScanImageTiffReader(tiff).data
-tiff.shape
-tiff = tiff[:-(141495-139504)]
-save_path = '\\\\sv-nas1.rcp.epfl.ch\\Petersen-Lab\\analysis\\Anthony_Renard\\need_fix\\AR141\\AR141_20240520\\imaging\\AR141_20240520_1\\AR141_20240520_00003_cor.tif'
-tiff.imsave(save_path, tiff)
-
-# Checking n imaging frames for AR163
-
-path = r'//sv-nas1.rcp.epfl.ch/Petersen-Lab/data/AR163/Training/AR163_20241125_153447/log_continuous.bin'
-log = np.fromfile(path)
+        cut = args.cut_sample
+    write_log(truncate_log(log, int(cut)), args.out)
+    print(f'Wrote {args.out}, cut at sample {int(cut)}.')
 
 
-galvo_events = find_peaks(log[1::6], distance=100, prominence=1)[0]
-print(galvo_events.size)
-print(galvo_events.size/30/3600)
+def _cli_count_frames(args):
+    if args.log:
+        print('galvo (imaging) frames :', detect_galvo_frames(read_log(args.log)).size)
+        print('camera frames          :', detect_camera_frames(read_log(args.log)).size)
+    if args.tiff:
+        print('tiff frames            :', count_tiff_frames(args.tiff))
+    if args.tiff_folder:
+        print('tiff frames (folder)   :', count_tiff_frames_in_folder(args.tiff_folder))
+    if args.avi:
+        print('avi frames             :', count_avi_frames(args.avi))
 
-tiff_path = r"//sv-nas1.rcp.epfl.ch/Petersen-Lab/data/AR163/Recording/Imaging/AR163_20241125_153447/AR163_20241125_153447.tif"
-nframes = ScanImageTiffReader(tiff_path).shape()[0]
+
+def _build_parser():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    sub = parser.add_subparsers(dest='command', required=True)
+
+    p = sub.add_parser('stitch-logs', help='Concatenate two split logs.')
+    p.add_argument('log1'); p.add_argument('log2'); p.add_argument('out')
+    p.add_argument('--trim-end1', type=int, default=0,
+                   help='Samples (per channel) to drop from end of log1.')
+    p.set_defaults(func=_cli_stitch_logs)
+
+    p = sub.add_parser('truncate-log', help='Zero a log after a sample.')
+    p.add_argument('log'); p.add_argument('out')
+    p.add_argument('--cut-sample', type=int, default=None)
+    p.add_argument('--at-last-trial', action='store_true',
+                   help='Cut a fixed time after the last detected trial start.')
+    p.add_argument('--post-trial-s', type=float, default=6.0)
+    p.set_defaults(func=_cli_truncate_log)
+
+    p = sub.add_parser('count-frames', help='Count frames in a log/tiff/avi.')
+    p.add_argument('--log'); p.add_argument('--tiff')
+    p.add_argument('--tiff-folder'); p.add_argument('--avi')
+    p.set_defaults(func=_cli_count_frames)
+
+    return parser
+
+
+if __name__ == '__main__':
+    args = _build_parser().parse_args()
+    args.func(args)

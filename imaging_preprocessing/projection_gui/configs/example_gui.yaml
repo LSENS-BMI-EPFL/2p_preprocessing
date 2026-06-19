@@ -1,0 +1,42 @@
+# Example config for the projection-neuron classification GUI.
+#
+#   python projection_gui.py                       # uses this file
+#   python projection_gui.py my_config.yaml        # uses your file
+#
+# Copy and edit per experiment. No Python changes needed.
+
+# --- Who / what ------------------------------------------------------------
+experimenter: RD              # initials, mapped to a folder via config.py
+mice: [RD121]                 # mice whose sessions appear in the GUI dropdown
+on_haas: false                # true -> HAAS mounts; false -> lab server
+
+# --- GUI / projection-specific options -------------------------------------
+projection_gui:
+  # Where the per-session projection tiffs live, under the DATA root:
+  #   <data_root>/<mouse>/Recording/projection_neurons/<session>_projections
+  projection_subpath: [Recording, projection_neurons]
+  projection_suffix: _projections
+
+  # Suite2p output location, under <analysis>/<mouse>/<session>/
+  suite2p_subpath: [suite2p, plane0]
+
+  # Sub-folder (under the session) where classified ROI labels are saved, and
+  # the marker the session list uses to skip already-labelled sessions.
+  output_subdir: projection_neurons
+
+  # SimpleITK/elastix registration model: affine, rigid, translation, bspline.
+  registration_parameter_map: affine
+
+  # Substrings identifying each channel's tiff inside the projection folder.
+  channel_tags:
+    baseline: gcamp      # functional/baseline green image
+    ctb_red: ctb         # CTB red injection
+    ctb_farred: _FR      # CTB far-red injection
+    red_reg: _R2         # red registration reference
+
+# --- Optional overrides (same as the pipeline config) ----------------------
+# paths:
+#   data_root: "//sv-nas1.rcp.epfl.ch/Petersen-Lab/data"
+#   analysis_root: "//sv-nas1.rcp.epfl.ch/Petersen-Lab/analysis"
+# experimenter_map:
+#   XY: Firstname_Lastname
