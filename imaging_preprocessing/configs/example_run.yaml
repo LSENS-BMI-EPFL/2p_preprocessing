@@ -1,21 +1,24 @@
 # Example run config for the 2P preprocessing pipeline.
 #
 # A single config can drive BOTH stages:
-#   python run_suite2p.py --config configs/example_run.yaml
-#   python compute_dff.py  --config configs/example_run.yaml
+#   python run_suite2p.py         --config configs/example_run.yaml
+#   python compute_dff_updated.py --config configs/example_run.yaml
+#
+# compute_dff_updated.py is the dF/F script to use (reads the dff_updated:
+# block). compute_dff.py is the old method, kept for comparison (reads dff:).
 #
 # Copy this file, rename it per experiment, and edit the values. Nothing in the
 # Python scripts needs to change.
 
 # --- Who / what to process -------------------------------------------------
-experimenter: RD                 # initials, mapped to a folder via experimenter_map
-mice: [RD116, RD119, RD121]      # mice to process
+experimenter: MS                 # initials, mapped to a folder via experimenter_map
+mice: [MS287]      # mice to process
 on_haas: true                    # true -> HAAS cluster mounts; false -> lab server
 
 # --- run_suite2p.py options ------------------------------------------------
 longitudinal: false              # true: concatenate all sessions, one run per mouse
-start_date: "20260610"           # skip sessions before this date (null to disable)
-session_to_do: null              # process only this exact session id (null = all)
+start_date: "20260928"           # skip sessions before this date (null to disable)
+session_to_do: ["MS287_20260928_150340"]             # process only this exact session id (null = all)
 excluded_sessions:
   - RD121_20260428_115902
   - RD116_20260507_094904
@@ -36,7 +39,21 @@ suite2p_ops:
     sparsery_settings:
       max_ROIs: 1000
 
-# --- compute_dff.py options ------------------------------------------------
+# --- compute_dff_updated.py options ----------------------------------------
+dff_updated:
+  neuropil_coef: 0.7             # F_cor = F_raw - neuropil_coef * F_neu
+  window: 60                     # rolling F0 window (s), TOTAL width (not per side)
+  percentile: 8                  # percentile of F_cor taken as F0
+  sigma: 1                       # gaussian smoothing (s) applied before the percentile
+  min_f0: 1                      # floor on F0, avoids division by ~0
+  artifact_merge_gap: 2          # suite2p bad frames closer than this (s) form one artifact
+  artifact_pad: 2                # artifacts extended by this (s) on each side
+  example_cells: quality         # dff_check.png cells: quality, random or first
+  plot_duration: 180             # length (s) of the segment shown in dff_check.png
+  contamination_threshold: 0.8   # cells above are flagged in noise_distributions.png
+  overwrite: true               # recompute even if dff.npy already exists
+
+# --- compute_dff.py options (old method) -----------------------------------
 dff:
   neuropil_coeff: 0.7            # F_cor = F_raw - neuropil_coeff * F_neu
   window: 30                    # baseline window (s) on each side of a sample

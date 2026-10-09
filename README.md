@@ -16,7 +16,7 @@ cd imaging_preprocessing
 python run_suite2p.py --config configs/my_experiment.yaml
 
 # 2. Neuropil correction + ΔF/F
-python compute_dff.py --config configs/my_experiment.yaml
+python compute_dff_updated.py --config configs/my_experiment.yaml
 ```
 
 A single config drives both stages. See the comments in the example file for
@@ -25,6 +25,35 @@ parameters, folder layout, and storage roots).
 
 Running a script **without** `--config` reproduces the previous hardcoded
 behaviour, so existing usage is unchanged.
+
+### ΔF/F: `compute_dff_updated.py` vs `compute_dff.py`
+
+`compute_dff_updated.py` is the ΔF/F script to use. `compute_dff.py` is the
+old method, kept for comparison. Both run from the same config but read
+different blocks, because their parameters (notably `window`) do not mean the
+same thing.
+
+| | `compute_dff.py` (old) | `compute_dff_updated.py` |
+|---|---|---|
+| Config block | `dff:` | `dff_updated:` |
+| Neuropil correction | `F_cor = F - 0.7·Fneu`, clipped at 0 | `F_cor = F - 0.7·Fneu`, not clipped |
+| Baseline F0 | 1 Hz FIR lowpass → rolling min/max filter (`window` = 30 s **per side**) → gaussian smoothing (5 s) | gaussian smoothing (1 s) → rolling **8th percentile** (`window` = 60 s **total**) |
+| ΔF/F | `(F_cor − F0_cor) / F0_raw`: divided by the baseline of the **raw** trace | `(F_cor − F0) / F0`: divided by the baseline of the **neuropil-corrected** trace (F0 floored at 1) |
+| Motion artifacts | ignored | suite2p `badframes` merged (< 2 s apart) and padded (2 s); excluded from F0 and set to NaN in `dff.npy` / `F_cor.npy` |
+| Merged ROIs | set to non-cell in memory only | set to non-cell and **written to `iscell.npy`** (original kept as `iscell_original.npy`) |
+| Saved traces | `F_raw`, `F_neu`, `F0_raw`, `F0_cor`, `dff` | `F_raw`, `F_neu`, `F_cor`, `F_cor_bad`, `F0`, `dff`, `dff_bad`, `artifact_frames` |
+| QC | none | `noise_metrics.csv` + one `.npy` per metric (`noise_abs`, `noise_rel`, `snr`, `neuropil_ratio`, `neuropil_f_rho`, `contamination`), `dff_check.png`, `noise_distributions.png` |
+
+Things to keep in mind when switching:
+
+- **ΔF/F values are not comparable between the two scripts.** Dividing by the
+  corrected baseline gives larger values, especially for cells with strong
+  neuropil. Cells whose corrected baseline is close to 0 get very large values;
+  the script logs them (F0 < 10% of raw F).
+- `dff.npy` now contains NaN on artifact frames: use NaN-aware functions
+  (`np.nanmean`, …) or load `dff_bad.npy` for the unmasked trace.
+- `F0_raw.npy` and `F0_cor.npy` are no longer written.
+- Both scripts skip sessions that already have a `dff.npy` unless `overwrite: true`.
 
 ### Shared settings
 
