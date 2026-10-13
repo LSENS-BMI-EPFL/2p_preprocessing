@@ -32,6 +32,7 @@ EXPERIMENTER_MAP = {
     'GF': 'Anthony_Renard',
     'MI': 'Anthony_Renard',
     'AS': 'Morgane_Storey',
+    'LG': 'Lynn_Geyer'
 }
 
 
