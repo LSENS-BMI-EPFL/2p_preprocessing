@@ -108,7 +108,7 @@ def run(ops, mice_ids, experimenter, longitudinal=False,
         mice_ids, experimenter, longitudinal, excluded_sessions, haas_path,
         date, session_to_do, imaging_subpath, session_date_format, paths,
         experimenter_map)
-    print(f'dbs : {dbs}', flush=True)
+    print(f'dbs : {dbs}, {len(dbs)} sessions', flush=True)
 
     n = len(dbs)
     for i, dbi in enumerate(dbs):

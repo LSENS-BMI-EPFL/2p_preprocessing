@@ -393,11 +393,11 @@ def process_suite2p_folder(suite2p_folder, neuropil_coef=0.7, window=60, percent
         f'| masked frames (merged + padded): {bad_frames.sum()} ({100 * bad_frames.mean():.3f}%)')
 
     log('Computing F_cor, F0 (rolling percentile) and dff.')
-    # _bad: artifact frames kept. Without suffix: artifact frames set to NaN.
-    F_cor_bad, F0, dff_bad = compute_dff(F_raw, F_neu, fs=ops['fs'], neuropil_coef=neuropil_coef, window=window,
-                                         percentile=percentile, sigma=sigma, min_f0=min_f0, bad_frames=bad_frames)
-    F_cor = mask_frames(F_cor_bad, bad_frames)
-    dff = mask_frames(dff_bad, bad_frames)
+    # Without suffix: artifact frames kept. _masked: artifact frames set to NaN.
+    F_cor, F0, dff = compute_dff(F_raw, F_neu, fs=ops['fs'], neuropil_coef=neuropil_coef, window=window,
+                                 percentile=percentile, sigma=sigma, min_f0=min_f0, bad_frames=bad_frames)
+    F_cor_masked = mask_frames(F_cor, bad_frames)
+    dff_masked = mask_frames(dff, bad_frames)
 
     # Cells whose neuropil-corrected baseline is tiny get huge dff values.
     low_f0 = np.median(F0, axis=1) < 0.1 * np.median(F_raw, axis=1)
@@ -405,19 +405,19 @@ def process_suite2p_folder(suite2p_folder, neuropil_coef=0.7, window=60, percent
         log(f'{low_f0.sum()} cells with F0 < 10% of raw F (dff unreliable): {np.where(low_f0)[0]}')
 
     # Saving data.
-    log('Saving F_raw, F_neu, F_cor, F_cor_bad, F0, dff, dff_bad, artifact_frames.')
+    log('Saving F_raw, F_neu, F_cor, F_cor_masked, F0, dff, dff_masked, artifact_frames.')
     np.save(os.path.join(suite2p_folder, 'F_raw'), F_raw)
     np.save(os.path.join(suite2p_folder, 'F_neu'), F_neu)
     np.save(os.path.join(suite2p_folder, 'F_cor'), F_cor)
-    np.save(os.path.join(suite2p_folder, 'F_cor_bad'), F_cor_bad)
+    np.save(os.path.join(suite2p_folder, 'F_cor_masked'), F_cor_masked)
     np.save(os.path.join(suite2p_folder, 'F0'), F0)
     np.save(os.path.join(suite2p_folder, 'dff'), dff)
-    np.save(os.path.join(suite2p_folder, 'dff_bad'), dff_bad)
+    np.save(os.path.join(suite2p_folder, 'dff_masked'), dff_masked)
     np.save(os.path.join(suite2p_folder, 'artifact_frames'), bad_frames)
 
     # Noise metrics, on artifact-free traces. roi = index in the full suite2p roi list.
     log('Computing noise and contamination metrics.')
-    metrics = pd.concat([compute_noise_metrics(F_cor, dff),
+    metrics = pd.concat([compute_noise_metrics(F_cor_masked, dff_masked),
                          compute_contamination_metrics(F_raw, F_neu, fs=ops['fs'], neuropil_coef=neuropil_coef,
                                                        bad_frames=bad_frames)], axis=1)
     metrics.insert(0, 'roi', np.where(iscell[:, 0] == 1.)[0])
@@ -432,7 +432,7 @@ def process_suite2p_folder(suite2p_folder, neuropil_coef=0.7, window=60, percent
     # Figures, same example cells in both.
     log('Plotting dff_check.png and noise_distributions.png.')
     cells, cell_labels = select_example_cells(metrics, mode=example_cells)
-    plot_dff_check(F_raw, F_neu, F_cor_bad, F0, dff, fs=ops['fs'], cells=cells, cell_labels=cell_labels,
+    plot_dff_check(F_raw, F_neu, F_cor, F0, dff_masked, fs=ops['fs'], cells=cells, cell_labels=cell_labels,
                    duration=plot_duration, metrics=metrics,
                    bad_frames=bad_frames, save_path=os.path.join(suite2p_folder, 'dff_check.png'))
     plot_noise_distributions(metrics, cells=cells, contamination_threshold=contamination_threshold,

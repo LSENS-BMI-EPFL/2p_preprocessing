@@ -17,9 +17,13 @@ python run_suite2p.py --config configs/my_experiment.yaml
 
 # 2. Neuropil correction + ΔF/F
 python compute_dff_updated.py --config configs/my_experiment.yaml
+
+# 3. Spike inference (CASCADE) + quantification, in the Cascade env
+conda activate Cascade
+python run_cascade_inference.py --config configs/my_experiment.yaml
 ```
 
-A single config drives both stages. See the comments in the example file for
+A single config drives all stages. See the comments in the example file for
 every available option (which mice/sessions, Suite2p `ops` overrides, ΔF/F
 parameters, folder layout, and storage roots).
 
@@ -39,9 +43,9 @@ same thing.
 | Neuropil correction | `F_cor = F - 0.7·Fneu`, clipped at 0 | `F_cor = F - 0.7·Fneu`, not clipped |
 | Baseline F0 | 1 Hz FIR lowpass → rolling min/max filter (`window` = 30 s **per side**) → gaussian smoothing (5 s) | gaussian smoothing (1 s) → rolling **8th percentile** (`window` = 60 s **total**) |
 | ΔF/F | `(F_cor − F0_cor) / F0_raw`: divided by the baseline of the **raw** trace | `(F_cor − F0) / F0`: divided by the baseline of the **neuropil-corrected** trace (F0 floored at 1) |
-| Motion artifacts | ignored | suite2p `badframes` merged (< 2 s apart) and padded (2 s); excluded from F0 and set to NaN in `dff.npy` / `F_cor.npy` |
+| Motion artifacts | ignored | suite2p `badframes` merged (< 2 s apart) and padded (2 s); excluded from F0 and set to NaN in `dff_masked.npy` / `F_cor_masked.npy` |
 | Merged ROIs | set to non-cell in memory only | set to non-cell and **written to `iscell.npy`** (original kept as `iscell_original.npy`) |
-| Saved traces | `F_raw`, `F_neu`, `F0_raw`, `F0_cor`, `dff` | `F_raw`, `F_neu`, `F_cor`, `F_cor_bad`, `F0`, `dff`, `dff_bad`, `artifact_frames` |
+| Saved traces | `F_raw`, `F_neu`, `F0_raw`, `F0_cor`, `dff` | `F_raw`, `F_neu`, `F_cor`, `F_cor_masked`, `F0`, `dff`, `dff_masked`, `artifact_frames` |
 | QC | none | `noise_metrics.csv` + one `.npy` per metric (`noise_abs`, `noise_rel`, `snr`, `neuropil_ratio`, `neuropil_f_rho`, `contamination`), `dff_check.png`, `noise_distributions.png` |
 
 Things to keep in mind when switching:
@@ -50,10 +54,60 @@ Things to keep in mind when switching:
   corrected baseline gives larger values, especially for cells with strong
   neuropil. Cells whose corrected baseline is close to 0 get very large values;
   the script logs them (F0 < 10% of raw F).
-- `dff.npy` now contains NaN on artifact frames: use NaN-aware functions
-  (`np.nanmean`, …) or load `dff_bad.npy` for the unmasked trace.
+- `dff.npy` keeps artifact frames. `dff_masked.npy` has them set to NaN: use
+  NaN-aware functions (`np.nanmean`, …) on it.
 - `F0_raw.npy` and `F0_cor.npy` are no longer written.
 - Both scripts skip sessions that already have a `dff.npy` unless `overwrite: true`.
+
+### Spike inference: `run_cascade_inference.py`
+
+Runs [CASCADE](https://github.com/HelmchenLabSoftware/Cascade) on `dff.npy`
+(NaN-free, artifact frames kept), then plots quantification figures. Settings
+are in the config's `cascade:` block.
+
+**It needs its own environment.** CASCADE installed from git needs python 3.7
+and tensorflow 2.3 (numpy 1.18), which can't be installed alongside the latest
+suite2p. Steps 1–2 run in the suite2p env and step 3 runs in the `Cascade` env:
+
+```bash
+git clone https://github.com/HelmchenLabSoftware/Cascade
+# conda only provides python; the packages come from pip (a conda solve of the full list is very slow).
+conda create -n Cascade python=3.7
+conda activate Cascade
+pip install tensorflow==2.3.0 matplotlib seaborn ruamel.yaml pyyaml tqdm
+```
+
+`tensorflow==2.3.0` pulls in the numpy/scipy/h5py versions it needs
+(numpy 1.18, scipy 1.4.1, h5py 2.10), so don't pin or upgrade them separately.
+
+- `cascade2p` is not pip-installed. The script imports it from
+  `cascade.cascade_repo` and runs from that folder, because CASCADE looks for
+  `Pretrained_models/` and `Ground_truth/` relative to it.
+- `cascade_repo` must be reachable from the machine running the script. To run
+  on HAAS, clone CASCADE on the analysis share and use its `/mnt/lsens-analysis/...`
+  path. The `Cascade` env itself still has to be created on HAAS. The model is
+  downloaded into the clone on the first run, so that run needs internet access.
+- The Cascade env can't read `ops.npy` (it was pickled with numpy 2), so the
+  frame rate comes from `cascade.frame_rate`.
+- `config.py` only needs `pyyaml`, so both environments share it.
+
+Outputs go to `<suite2p folder>/<model_name>/`:
+
+| File | Content |
+|---|---|
+| `spike_rate_prediction.npy` | CASCADE output, expected spikes **per frame** (× frame rate = spk/s), NaN at the edges |
+| `discrete_spikes.npy` | object array, spike frame indices per cell, as returned by CASCADE: **1 frame early**, add 1 (`allow_pickle=True`) |
+| `spike_counts.npy` | discrete spikes binned per frame, `(n_cells, n_frames)` int, 1-frame offset corrected |
+| `noise_level_distribution.png`, `noise_matched_ground_truth.png` | CASCADE QC for model choice |
+| `n_spikes_events_hist.png` | events per spike count (spiking frames < `gap_s` apart are merged) |
+| `dff_single_by_n_spikes.png` | single ΔF/F responses to isolated frames, `n_single_examples` per spike count, with the mean overlaid |
+| `dff_avg_by_n_spikes.png` | mean ± sem ΔF/F, all events vs isolated frames |
+| `dff_linearity_isolated.png` | peak ΔF/F vs spike count, fit through the origin |
+| `example_cells_f_dff_rate_spikes.png` | F raw, ΔF/F, rate and spike counts for example cells (`snr.npy` ≥ `example_snr_min`) |
+
+The quantification doesn't need NWB. Time is frame index / frame rate, with
+0 at imaging start. Saved predictions are reused unless `overwrite: true`.
+The figures are redone on every run.
 
 ### Shared settings
 
