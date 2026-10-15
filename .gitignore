@@ -1,3 +1,11 @@
 __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
+
+.vscode/
+
+*.log
+
+imaging_preprocessing/configs/my_experiment.yaml
+
+imaging_preprocessing/configs/example_run.yaml

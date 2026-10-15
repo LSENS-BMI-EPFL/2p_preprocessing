@@ -395,6 +395,8 @@ def run_from_config(config):
 
 
 if __name__ == '__main__':
+    # Print each line immediately, also when piped (tee) or run in tmux.
+    sys.stdout.reconfigure(line_buffering=True)
     parser = argparse.ArgumentParser(
         description='CASCADE spike inference on dff.npy and quantification figures. '
                     'Run in the Cascade environment (see README).')

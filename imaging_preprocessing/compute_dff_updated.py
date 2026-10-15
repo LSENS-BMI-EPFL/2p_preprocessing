@@ -1,5 +1,6 @@
 import argparse
 import os
+import sys
 import time
 import scipy
 import numpy as np
@@ -480,6 +481,8 @@ def _legacy_main():
 
 
 if __name__ == '__main__':
+    # Print each line immediately, also when piped (tee) or run in tmux.
+    sys.stdout.reconfigure(line_buffering=True)
     parser = argparse.ArgumentParser(
         description='Compute dF/F (rolling-percentile F0, artifact masking, QC metrics) '
                     'for Suite2p outputs from a YAML config.')
