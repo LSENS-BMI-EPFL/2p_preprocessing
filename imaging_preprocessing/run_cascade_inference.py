@@ -68,6 +68,13 @@ def spike_counts_per_frame(spike_frames, n_frames):
     return counts
 
 
+def window_any(mask, before, after):
+    # True at frame t if mask has any True frame in [t - before, t + after].
+    csum = np.r_[0, np.cumsum(mask)]
+    t = np.arange(mask.size)
+    return csum[np.clip(t + after + 1, 0, mask.size)] - csum[np.clip(t - before, 0, mask.size)] > 0
+
+
 def extract_snippets(traces, onsets_per_cell, pre, post):
     """Dff snippets around onsets (one array of onset frames per cell), baseline-subtracted on the pre-onset window."""
     snippets = np.array([traces[cell, onset - pre:onset + post]
@@ -86,8 +93,11 @@ def save_figure(fig, save_folder, name):
 
 
 def run_inference(dff, model_name, model_folder, frame_rate, save_folder, cascade, infer_discrete_spikes,
-                  plot_noise_level_distribution, plot_noise_matched_ground_truth, overwrite, log):
+                  plot_noise_level_distribution, plot_noise_matched_ground_truth, overwrite, log, dff_noise=None):
     # CASCADE predictions and discrete spikes. Existing files are reused unless overwrite.
+    # Predictions run on the full dff (CASCADE cannot take NaN). The noise level of each cell, which
+    # selects the model ensemble and so calibrates the spike rate, is taken from dff_noise (dff_masked:
+    # artifact frames ignored) when given.
     prob_path = os.path.join(save_folder, 'spike_rate_prediction.npy')
     spikes_path = os.path.join(save_folder, 'discrete_spikes.npy')
 
@@ -96,15 +106,17 @@ def run_inference(dff, model_name, model_folder, frame_rate, save_folder, cascad
         spike_prob = np.load(prob_path)
     else:
         noise_levels = plot_noise_level_distribution(
-            dff, frame_rate, save_path=os.path.join(save_folder, 'noise_level_distribution.png'))
+            dff if dff_noise is None else dff_noise, frame_rate,
+            save_path=os.path.join(save_folder, 'noise_level_distribution.png'))
         plt.close('all')
-        log(f'Median CASCADE noise level: {np.nanmedian(noise_levels):.2f}.')
+        log(f'Median CASCADE noise level: {np.nanmedian(noise_levels):.2f}'
+            + (' (artifact frames excluded).' if dff_noise is not None else '.'))
         plot_noise_matched_ground_truth(model_name, np.round(np.nanmedian(noise_levels)), frame_rate,
                                         nb_traces=8, duration=50,
                                         save_path=os.path.join(save_folder, 'noise_matched_ground_truth.png'))
         plt.close('all')
         log('Predicting spike rates.')
-        spike_prob = cascade.predict(model_name, dff, model_folder=model_folder)
+        spike_prob = cascade.predict(model_name, dff, model_folder=model_folder, trace_noise_levels=noise_levels)
         np.save(prob_path, spike_prob)
 
     if os.path.exists(spikes_path) and not overwrite:
@@ -127,16 +139,30 @@ def run_inference(dff, model_name, model_folder, frame_rate, save_folder, cascad
 
 
 def quantify(raw_traces, traces, rate, spikes, imaging_rate, save_folder, session_id, neuron_snr=None,
+             artifacts=None, unreliable=None, excluded_cells=None,
              gap_s=0.03, n_spikes_to_plot=(1, 2, 3, 5, 10, 20), t_before=0.2, t_after=1,
              clear_before=0.5, clear_after=0.5, n_single_examples=3, n_example_cells=5, example_snr_min=None,
              example_first_cells=True, example_t_start=180, example_t_length=60, seed=0):
     '''
     Quantification figures.
     raw_traces: F_raw (a.u.), traces: dF/F (%), rate: spk/s, spikes: discrete spike count per frame.
+    artifacts: artifact frames (shaded in the example figure).
+    unreliable: frames whose spikes are unreliable (on or near an artifact). Events
+                whose dF/F or clear window contains such a frame are left out.
+    excluded_cells: bool per cell, cells left out of every figure (e.g. collapsed baseline).
     Time is frames / imaging_rate, 0 at imaging start.
     '''
     rng = np.random.default_rng(seed)
+    if excluded_cells is not None and excluded_cells.any():
+        # No spike -> no event for excluded cells. Cell indices stay those of dff.
+        spikes = np.where(excluded_cells[:, None], 0, spikes)
+        session_id = f'{session_id} ({excluded_cells.sum()} cells excluded)'
     frame_timestamps = np.arange(traces.shape[1]) / imaging_rate
+    pre, post = int(round(t_before * imaging_rate)), int(round(t_after * imaging_rate))
+    cw_pre, cw_post = int(round(clear_before * imaging_rate)), int(round(clear_after * imaging_rate))
+    # Onset frames usable for events: no unreliable frame in the dF/F or clear window around them.
+    usable = (np.ones(traces.shape[1], dtype=bool) if unreliable is None
+              else ~window_any(unreliable, max(pre, cw_pre), max(post, cw_post)))
 
     # Sort spiking event according to number of spike sum with rolling window of size n_frames = param * sampling rate
     # Spiking frames separated by <= gap_frames are merged into one event; event size = summed spikes
@@ -151,8 +177,9 @@ def quantify(raw_traces, traces, rate, spikes, imaging_rate, save_folder, sessio
             continue
         event_starts = np.r_[0, np.flatnonzero(np.diff(active) > gap_frames) + 1]
         n_spikes = np.round(np.add.reduceat(cell_spikes[active], event_starts)).astype(int)
-        events_n_spikes.append(n_spikes[n_spikes > 0])
-        events_onset.append(active[event_starts][n_spikes > 0])
+        keep = (n_spikes > 0) & usable[active[event_starts]]
+        events_n_spikes.append(n_spikes[keep])
+        events_onset.append(active[event_starts][keep])
 
     # Per-cell histogram: occurrences of n-spike events (n >= 1)
     max_n = max(1, max((e.max() for e in events_n_spikes if e.size), default=1))
@@ -168,14 +195,12 @@ def quantify(raw_traces, traces, rate, spikes, imaging_rate, save_folder, sessio
     save_figure(fig, save_folder, 'n_spikes_events_hist')
 
     # Isolated frames: frame with n spikes and no other spiking frame within the clear window around it
-    pre, post = int(round(t_before * imaging_rate)), int(round(t_after * imaging_rate))
     t = np.arange(-pre, post) / imaging_rate
-    cw_pre, cw_post = int(round(clear_before * imaging_rate)), int(round(clear_after * imaging_rate))
     active_cumsum = np.concatenate([np.zeros((spikes.shape[0], 1), dtype=int), np.cumsum(spikes > 0, axis=1)], axis=1)
     frames = np.arange(spikes.shape[1])
     lo, hi = np.clip(frames - cw_pre, 0, None), np.clip(frames + cw_post + 1, None, spikes.shape[1])
     n_active_in_window = active_cumsum[:, hi] - active_cumsum[:, lo]  # (n_cells, n_frames), includes the frame itself
-    isolated = n_active_in_window == 1
+    isolated = (n_active_in_window == 1) & usable[None, :]
     iso_onsets = {n: [np.flatnonzero((spikes[cell] == n) & isolated[cell]) for cell in range(traces.shape[0])]
                   for n in n_spikes_to_plot}
 
@@ -279,6 +304,8 @@ def quantify(raw_traces, traces, rate, spikes, imaging_rate, save_folder, sessio
     else:
         candidates = np.arange(traces.shape[0])
         snr_label = 'no SNR cut'
+    if excluded_cells is not None:
+        candidates = candidates[~excluded_cells[candidates]]
     if example_first_cells:
         example_cells = candidates[:n_example_cells]
     else:
@@ -312,13 +339,23 @@ def quantify(raw_traces, traces, rate, spikes, imaging_rate, save_folder, sessio
         ax_count.set_ylabel('Spk /\nframe')
         for ax in (ax_raw, ax_dff, ax_rate, ax_count):
             ax.spines[['top', 'right']].set_visible(False)
-    axes[-1].set_xlabel('Time from imaging start (s)')
+    # Artifact periods shaded on every panel.
+    if artifacts is not None and artifacts[f0:f1].any():
+        edges = np.diff(np.r_[0, artifacts[f0:f1].astype(int), 0])
+        for a, b in zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)):
+            for ax in axes:
+                ax.axvspan(t_ex[a], t_ex[b - 1], color='grey', alpha=0.25, lw=0)
+    axes[-1].set_xlabel('Time from imaging start (s)' + ('  (grey: artifacts)' if artifacts is not None else ''))
     fig.suptitle(f'{session_id} - example cells ({snr_label})')
     save_figure(fig, save_folder, 'example_cells_f_dff_rate_spikes')
 
 
 def process_suite2p_folder(suite2p_folder, model_name, model_folder, frame_rate, cascade_funcs, overwrite=False,
-                           **quant_params):
+                           spike_exclusion_pad=0.0, neuropil_ratio_threshold=0.8, **quant_params):
+    # neuropil_ratio_threshold: cells above (collapsed F_cor baseline, exploding dF/F) are left out of the
+    # quantification figures. Their spikes are still inferred and saved.
+    # spike_exclusion_pad: spikes within this many seconds of an artifact frame are left out of the
+    # quantification (CASCADE looks at +-32 frames, so nearby predictions can be affected).
     tqdm.write(f'\nProcessing {suite2p_folder}.')
     t_start = time.time()
 
@@ -343,13 +380,39 @@ def process_suite2p_folder(suite2p_folder, model_name, model_folder, frame_rate,
         neuron_snr = None
     log(f'{dff.shape[0]} cells x {dff.shape[1]} frames ({dff.shape[1] / frame_rate / 60:.1f} min at {frame_rate} Hz).')
 
+    # Artifact frames from compute_dff_updated (suite2p badframes + motion), absent for older outputs.
+    artifacts, dff_masked, unreliable = None, None, None
+    art_path = os.path.join(suite2p_folder, 'artifact_frames.npy')
+    if os.path.exists(art_path):
+        artifacts = np.load(art_path).astype(bool)
+        if artifacts.size != dff.shape[1]:
+            log(f'artifact_frames.npy has {artifacts.size} frames for {dff.shape[1]}, ignored.')
+            artifacts = None
+    if artifacts is not None and artifacts.any():
+        dff_masked = np.load(os.path.join(suite2p_folder, 'dff_masked.npy'))
+        pad = int(round(spike_exclusion_pad * frame_rate))
+        unreliable = window_any(artifacts, pad, pad)
+        log(f'Artifact frames: {100 * artifacts.mean():.1f}% | with +-{spike_exclusion_pad} s padding: '
+            f'{100 * unreliable.mean():.1f}% of frames left out of the quantification.')
+
     spike_prob, spikes = run_inference(dff, model_name, model_folder, frame_rate, save_folder, *cascade_funcs,
-                                       overwrite=overwrite, log=log)
+                                       overwrite=overwrite, log=log, dff_noise=dff_masked)
+    del dff_masked
+
+    excluded_cells = None
+    ratio_path = os.path.join(suite2p_folder, 'neuropil_ratio.npy')
+    if neuropil_ratio_threshold is not None and os.path.exists(ratio_path):
+        ratio = np.load(ratio_path)
+        if ratio.size == dff.shape[0]:
+            excluded_cells = ratio > neuropil_ratio_threshold
+            log(f'{excluded_cells.sum()} cells with neuropil_ratio > {neuropil_ratio_threshold} left out of the '
+                f'quantification: {np.flatnonzero(excluded_cells)}')
 
     log('Plotting quantification figures.')
     # CASCADE output is expected spikes per frame: x frame rate gives spk/s.
     quantify(F_raw, dff * 100, spike_prob * frame_rate, spikes, frame_rate, save_folder, session_id,
-             neuron_snr=neuron_snr, **quant_params)
+             neuron_snr=neuron_snr, artifacts=artifacts, unreliable=unreliable, excluded_cells=excluded_cells,
+             **quant_params)
     log(f'Done. Data saved: {save_folder}')
 
 
@@ -363,7 +426,8 @@ def run_from_config(config):
     # Spike inference + quantification for all requested mice/sessions, from the cascade: block.
     cfg = config.get('cascade') or {}
     layout = config.get('folder_layout') or {}
-    unknown = set(cfg) - set(QUANT_PARAMS) - {'cascade_repo', 'model_name', 'frame_rate', 'overwrite'}
+    unknown = set(cfg) - set(QUANT_PARAMS) - {'cascade_repo', 'model_name', 'frame_rate', 'overwrite',
+                                               'spike_exclusion_pad'}
     if unknown:
         raise KeyError(f'Unknown cascade options {sorted(unknown)}.')
     cascade_repo = os.path.abspath(cfg['cascade_repo'])
@@ -387,11 +451,13 @@ def run_from_config(config):
     model_folder = os.path.join(cascade_repo, 'Pretrained_models')
     if not os.path.isfile(os.path.join(model_folder, model_name, 'config.yaml')):
         cascade_funcs[0].download_model(model_name, model_folder=model_folder, verbose=1)
-
     params = {k: cfg[k] for k in QUANT_PARAMS if k in cfg}
     for suite2p_folder in tqdm(suite2p_folders, desc='CASCADE'):
         process_suite2p_folder(suite2p_folder, model_name, model_folder, frame_rate, cascade_funcs,
-                               overwrite=cfg.get('overwrite', False), **params)
+                               overwrite=cfg.get('overwrite', False),
+                               spike_exclusion_pad=cfg.get('spike_exclusion_pad', 0.0),
+                               neuropil_ratio_threshold=(config.get('dff_updated') or {}).get(
+                                   'neuropil_ratio_threshold', 0.8), **params)
 
 
 if __name__ == '__main__':

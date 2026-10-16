@@ -43,10 +43,10 @@ same thing.
 | Neuropil correction | `F_cor = F - 0.7·Fneu`, clipped at 0 | `F_cor = F - 0.7·Fneu`, not clipped |
 | Baseline F0 | 1 Hz FIR lowpass → rolling min/max filter (`window` = 30 s **per side**) → gaussian smoothing (5 s) | gaussian smoothing (1 s) → rolling **8th percentile** (`window` = 60 s **total**) |
 | ΔF/F | `(F_cor − F0_cor) / F0_raw`: divided by the baseline of the **raw** trace | `(F_cor − F0) / F0`: divided by the baseline of the **neuropil-corrected** trace (F0 floored at 1) |
-| Motion artifacts | ignored | suite2p `badframes` merged (< 2 s apart) and padded (2 s); excluded from F0 and set to NaN in `dff_masked.npy` / `F_cor_masked.npy` |
+| Motion artifacts | ignored | frames where the registration correlation `corrXY` drops below 0.7 × its 20 s rolling median (merged < 0.2 s, padded 0.25 s); excluded from F0 and set to NaN in `dff_masked.npy` / `F_cor_masked.npy` (same frames for every cell). suite2p `badframes` are not used: they all fall inside these periods |
 | Merged ROIs | set to non-cell in memory only | set to non-cell and **written to `iscell.npy`** (original kept as `iscell_original.npy`) |
 | Saved traces | `F_raw`, `F_neu`, `F0_raw`, `F0_cor`, `dff` | `F_raw`, `F_neu`, `F_cor`, `F_cor_masked`, `F0`, `dff`, `dff_masked`, `artifact_frames` |
-| QC | none | `noise_metrics.csv` + one `.npy` per metric (`noise_abs`, `noise_rel`, `snr`, `neuropil_ratio`, `neuropil_f_rho`, `contamination`), `dff_check.png`, `noise_distributions.png` |
+| QC | none | `noise_metrics.csv` + one `.npy` per metric (`noise_abs`, `noise_rel`, `snr`, `neuropil_ratio`, `neuropil_f_rho`, `contamination`, `motion_r`), `dff_check.png`, `noise_distributions.png` |
 
 Things to keep in mind when switching:
 
@@ -56,6 +56,22 @@ Things to keep in mind when switching:
   the script logs them (F0 < 10% of raw F).
 - `dff.npy` keeps artifact frames. `dff_masked.npy` has them set to NaN: use
   NaN-aware functions (`np.nanmean`, …) on it.
+- **suite2p `badframes` miss most motion artifacts.** Its `th_badframes` is
+  normalized by the session's mean shift, so frequent jumps never stand out.
+  The `corrXY` criterion (`motion_*` options) catches them, including every
+  suite2p bad frame. Share of frames masked: ~8-9% per session in RD130/RD132,
+  ~22% in RD134 (more task-evoked movement). Cells already deviate more than
+  usual at corrXY 0.8-0.9 x local median, so 0.7 is not a strict threshold.
+- **Cell-level QC is decided at analysis, not here.** Every `iscell == 1` cell is
+  kept. Useful cuts on the saved metrics:
+  - `neuropil_ratio` > ~0.8: neuropil subtraction removed most of the baseline,
+    F0 is tiny and dF/F explodes (single cells can produce most of a session's
+    "10-20 spike" events).
+  - |`motion_r`| large: dF/F follows registration quality frame by frame, i.e. a
+    motion artifact. Real population activity also lowers `corrXY`, so
+    moderate values are ambiguous.
+  - `contamination` = `neuropil_ratio` × `neuropil_f_rho` is negative when F and
+    F_neu are anticorrelated (often motion), so check `neuropil_ratio` as well.
 - `F0_raw.npy` and `F0_cor.npy` are no longer written.
 - Both scripts skip sessions that already have a `dff.npy` unless `overwrite: true`.
 
@@ -108,6 +124,22 @@ Outputs go to `<suite2p folder>/<model_name>/`:
 The quantification doesn't need NWB. Time is frame index / frame rate, with
 0 at imaging start. Saved predictions are reused unless `overwrite: true`.
 The figures are redone on every run.
+
+**Artifact frames and CASCADE.** CASCADE runs on the full `dff.npy`: it can't
+take NaN (`infer_discrete_spikes` would join the pieces around a gap and shift
+every later spike). Two things keep artifacts out:
+
+- Each cell's noise level, which selects the model ensemble and so calibrates
+  the spike rate, is computed on `dff_masked.npy` (artifact frames ignored).
+- The quantification figures leave out cells with `neuropil_ratio` above
+  `dff_updated: neuropil_ratio_threshold` (0.8): their collapsed baseline makes
+  dF/F explode, and a single such cell can dominate the large-event averages.
+  Their spikes are still inferred and saved.
+- The quantification leaves out spikes on artifact frames, plus
+  `spike_exclusion_pad` seconds around them (default 0). Each prediction looks
+  at a 64-frame window (±1.07 s at 30 Hz), so spikes next to an artifact can be
+  affected too, but excluding that full window would drop a large share of the
+  spikes in sessions with frequent movement.
 
 ### Shared settings
 

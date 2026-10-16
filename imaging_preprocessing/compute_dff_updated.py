@@ -28,10 +28,9 @@ def set_merged_roi_to_non_cell(stat, iscell):
 
 def get_artifact_mask(badframes, fs, merge_gap=2, pad=2):
     '''
-    Turn suite2p badframes into artifact periods.
-    suite2p only flags scattered frames inside a motion artifact, so flagged
-    frames closer than merge_gap (s) are merged into one artifact, and each
-    artifact is extended by pad (s) on both sides.
+    Turn flagged frames into artifact periods: flagged frames closer than
+    merge_gap (s) are merged into one artifact, and each artifact is extended
+    by pad (s) on both sides.
     Returns the boolean frame mask and the number of artifacts.
     '''
     mask = np.asarray(badframes).astype(bool)
@@ -42,6 +41,49 @@ def get_artifact_mask(badframes, fs, merge_gap=2, pad=2):
     _, n_artifacts = scipy.ndimage.label(mask)
 
     return mask, n_artifacts
+
+
+def load_corrxy(suite2p_folder, ops):
+    # Per-frame phase correlation of each frame with the registration reference
+    # image. reg_outputs.npy for recent suite2p, ops.npy for older versions.
+    reg_path = os.path.join(suite2p_folder, 'reg_outputs.npy')
+    if os.path.exists(reg_path):
+        reg = np.load(reg_path, allow_pickle=True).item()
+        if 'corrXY' in reg:
+            return np.asarray(reg['corrXY'], dtype=float)
+    if 'corrXY' in ops:
+        return np.asarray(ops['corrXY'], dtype=float)
+    return None
+
+
+def get_motion_frames(corrXY, fs, threshold=0.7, window=20):
+    '''
+    Frames whose correlation with the registration reference (corrXY) drops
+    below threshold x its rolling median over window (s). Catches uncorrected
+    motion (z-motion, large xy jumps) that suite2p badframes miss: its
+    th_badframes is normalized by the mean shift of the session, so frequent
+    jumps never stand out.
+    '''
+    local = scipy.ndimage.median_filter(corrXY, size=int(round(window * fs)) | 1, mode='nearest')
+    return corrXY < threshold * local
+
+
+def compute_motion_r(traces, corrXY, fs, detrend=10):
+    '''
+    Per-cell correlation between traces (dff: the analysed trace, after
+    neuropil subtraction, which can amplify or cancel an artifact) and corrXY,
+    slow drift removed (moving average over detrend s). ~0: trace unaffected
+    by motion. Large |r| (either sign): it follows registration quality frame
+    by frame, i.e. a structure moving in or out of the ROI. Strong population
+    activity also lowers corrXY, so moderate values can come from real activity.
+    '''
+    size = int(round(detrend * fs)) | 1
+    F = traces.astype(np.float32)
+    F -= scipy.ndimage.uniform_filter1d(F, size, axis=1, mode='nearest')
+    F -= F.mean(axis=1, keepdims=True)
+    c = corrXY - scipy.ndimage.uniform_filter1d(corrXY, size, mode='nearest')
+    c -= c.mean()
+    return (F @ c) / np.sqrt((F ** 2).sum(axis=1) * (c ** 2).sum())
 
 
 def compute_baseline(F, fs, window=60, percentile=8, sigma=1, bad_frames=None):
@@ -192,27 +234,35 @@ def select_example_cells(metrics, mode='quality', n_cells=6):
     return cells, labels
 
 
-def plot_noise_distributions(metrics, save_path, cells=None, contamination_threshold=0.8, neuropil_coef=0.7):
+def plot_noise_distributions(metrics, save_path, cells=None, contamination_threshold=0.8, neuropil_ratio_threshold=0.8,
+                             neuropil_coef=0.7, artifacts=None, fs=None):
     '''
-    Top: histograms of noise_abs, noise_rel, snr and contamination across cells.
-    Bottom: neuropil ratio vs neuropil_f_rho colored by SNR, and SNR vs contamination.
+    Top: histograms of noise_rel, snr, contamination and motion_r across cells
+    (noise_abs is saved but not plotted).
+    Bottom: neuropil ratio vs neuropil_f_rho colored by SNR, SNR vs contamination,
+    and, if artifacts (bool per frame) and fs are given, the distribution of
+    artifact period lengths with the share of the session masked.
     `cells` (indices) are marked so they can be matched with the dff_check figure.
     '''
-    columns = [('noise_abs', 'absolute noise (a.u.)'),
-               ('noise_rel', 'relative noise (dF/F0)'),
+    columns = [('noise_rel', 'relative noise (dF/F0)'),
                ('snr', 'SNR (99.9th pct of dF/F0 / noise rel)'),
                ('contamination', 'contamination (neuropil ratio x corr)')]
-    fig = plt.figure(figsize=(18, 9))
-    gs = fig.add_gridspec(2, 4, height_ratios=[1, 1.4])
-    axes = [fig.add_subplot(gs[0, i]) for i in range(4)]
+    if 'motion_r' in metrics and metrics.motion_r.notna().any():
+        columns.append(('motion_r', 'motion_r  corr(dF/F0, corrXY), drift removed'))
+    fig = plt.figure(figsize=(4.5 * len(columns), 9))
+    gs = fig.add_gridspec(2, len(columns), height_ratios=[1, 1.4])
+    axes = [fig.add_subplot(gs[0, i]) for i in range(len(columns))]
     for ax, (col, label) in zip(axes, columns):
         values = metrics[col].to_numpy()
-        # Cells with a tiny F0 have extreme values: clip the x range at
-        # median + 5 IQR so the bulk of the distribution stays readable.
-        q25, q50, q75 = np.percentile(values, [25, 50, 75])
-        xmax = min(values.max(), q50 + 5 * (q75 - q25))
+        if col == 'motion_r':
+            xmin, xmax = -1, 1
+        else:
+            # Cells with a tiny F0 have extreme values: clip the x range at
+            # median + 5 IQR so the bulk of the distribution stays readable.
+            q25, q50, q75 = np.percentile(values, [25, 50, 75])
+            xmin, xmax = values.min(), min(values.max(), q50 + 5 * (q75 - q25))
         n_out = np.sum(values > xmax)
-        ax.hist(values, bins=50, range=(values.min(), xmax), color='#2a78d6', edgecolor='#fcfcfb', linewidth=0.5)
+        ax.hist(values, bins=50, range=(xmin, xmax), color='#2a78d6', edgecolor='#fcfcfb', linewidth=0.5)
         ax.axvline(np.median(values), color='#0b0b0b', lw=1.5, ls='--')
         ax.set_title(f'median = {np.median(values):.3g}   n = {len(values)} cells'
                      + (f'   ({n_out} > {xmax:.3g} not shown)' if n_out else ''),
@@ -227,22 +277,45 @@ def plot_noise_distributions(metrics, save_path, cells=None, contamination_thres
         ax.set_xlabel(label)
         ax.set_ylabel('cells')
         ax.spines[['top', 'right']].set_visible(False)
+    ax_cont = axes[[col for col, _ in columns].index('contamination')]
     if cells is not None:
-        axes[-1].plot([], [], color='#eb6834', lw=1, label='cells in dff_check')
-        axes[-1].plot([], [], color='#0b0b0b', lw=1.5, ls='--', label='median')
-        axes[-1].legend(loc='center right', frameon=False, fontsize=8)
-    axes[-1].axvline(contamination_threshold, color='#e34948', lw=1, ls=':')
+        ax_cont.plot([], [], color='#eb6834', lw=1, label='cells in dff_check')
+        ax_cont.plot([], [], color='#0b0b0b', lw=1.5, ls='--', label='median')
+        ax_cont.legend(loc='center right', frameon=False, fontsize=8)
+    ax_cont.axvline(contamination_threshold, color='#e34948', lw=1, ls=':')
 
     # Contamination scatters.
     ratio, corr = metrics.neuropil_ratio.to_numpy(), metrics.neuropil_f_rho.to_numpy()
     contamination, snr = metrics.contamination.to_numpy(), metrics.snr.to_numpy()
     high = contamination > contamination_threshold
     ax_rc = fig.add_subplot(gs[1, :2])
-    ax_cs = fig.add_subplot(gs[1, 2:])
+    plot_artifacts = artifacts is not None and fs is not None and len(columns) > 3
+    ax_cs = fig.add_subplot(gs[1, 2:-1] if plot_artifacts else gs[1, 2:])
+
+    if plot_artifacts:
+        # Artifact periods: length distribution and share of the session masked.
+        ax_art = fig.add_subplot(gs[1, -1])
+        labels, n_periods = scipy.ndimage.label(artifacts)
+        lengths = np.bincount(labels.ravel())[1:] / fs
+        total = artifacts.sum()
+        title = (f'{n_periods} artifact periods, {total} frames\n'
+                 f'= {100 * total / artifacts.size:.1f}% of session ({total / fs / 60:.1f} min)')
+        if n_periods:
+            ax_art.hist(lengths, bins=np.logspace(np.log10(lengths.min()), np.log10(lengths.max() + 1e-9), 30),
+                        color='#898781', edgecolor='#fcfcfb', linewidth=0.5)
+            ax_art.set_xscale('log')
+            ax_art.axvline(np.median(lengths), color='#0b0b0b', lw=1.5, ls='--')
+            title += f'\nmedian length {np.median(lengths):.2f} s'
+        ax_art.set_title(title, fontsize=8, color='#52514e')
+        ax_art.set_xlabel('artifact period length (s)')
+        ax_art.set_ylabel('periods')
+        ax_art.spines[['top', 'right']].set_visible(False)
 
     sc = ax_rc.scatter(ratio, corr, c=np.log10(np.clip(snr, 1, None)), s=14, cmap='viridis')
     ax_rc.scatter(ratio[high], corr[high], s=50, facecolors='none', edgecolors='#e34948',
                   label=f'contamination > {contamination_threshold} ({high.sum()} cells)')
+    ax_rc.axvline(neuropil_ratio_threshold, color='#e34948', lw=1, ls='--',
+                  label=f'neuropil ratio > {neuropil_ratio_threshold} ({(ratio > neuropil_ratio_threshold).sum()} cells)')
     fig.colorbar(sc, ax=ax_rc, label='log10 SNR')
     ax_rc.set_xlabel(f'neuropil ratio  {neuropil_coef:g}·Fneu / F (baseline)')
     ax_rc.set_ylabel('neuropil_f_rho  corr(F, Fneu), 0.5-30 s')
@@ -270,12 +343,14 @@ def plot_noise_distributions(metrics, save_path, cells=None, contamination_thres
 
 
 def plot_dff_check(F_raw, F_neu, F_cor, F0, dff, fs, save_path, cells, metrics=None, bad_frames=None,
-                   duration=300, seed=None, cell_labels=None):
+                   duration=300, seed=None, cell_labels=None, corrXY=None, motion_threshold=None, motion_window=20):
     '''
     Plot F, Fneu, F_cor, F0 (left) and dff (right) for the given cells
     over a random segment of `duration` seconds. If metrics is given, the
-    SNR and contamination of each cell are written above its dff trace. Artifact
-    periods (bad_frames) are shaded.
+    SNR, contamination and motion_r of each cell are written above its dff
+    trace. Artifact periods (bad_frames) are shaded. If corrXY is given, it is
+    plotted below both columns, with the detection threshold (motion_threshold x
+    rolling median over motion_window s) dashed.
     '''
     rng = np.random.default_rng(seed)
     n = int(round(duration * fs))
@@ -288,10 +363,27 @@ def plot_dff_check(F_raw, F_neu, F_cor, F0, dff, fs, save_path, cells, metrics=N
 
     artifacts = []
     if bad_frames is not None:
-        labels, n = scipy.ndimage.label(bad_frames[sl])
+        labels, _ = scipy.ndimage.label(bad_frames[sl])
         artifacts = [(t[s][0], t[s][-1]) for s in scipy.ndimage.find_objects(labels)]
 
-    fig, axes = plt.subplots(len(cells), 2, figsize=(20, 2 * len(cells)), sharex=True, squeeze=False)
+    n_rows = len(cells) + (corrXY is not None)
+    fig, axes = plt.subplots(n_rows, 2, figsize=(26, 2.8 * n_rows), sharex=True, squeeze=False,
+                             gridspec_kw={'height_ratios': [1] * len(cells) + [0.7] * (corrXY is not None)})
+    if corrXY is not None:
+        # Registration correlation with the reference: drops = motion left after registration.
+        threshold = None
+        if motion_threshold is not None:
+            local = scipy.ndimage.median_filter(corrXY, size=int(round(motion_window * fs)) | 1, mode='nearest')
+            threshold = motion_threshold * local[sl]
+        for ax in axes[-1]:
+            for t0, t1 in artifacts:
+                ax.axvspan(t0, t1, color='#898781', alpha=0.25, lw=0)
+            ax.plot(t, corrXY[sl], color='#0b0b0b', lw=0.6, label='corrXY')
+            if threshold is not None:
+                ax.plot(t, threshold, color='#e34948', lw=1, ls='--', label=f'{motion_threshold} x local median')
+            ax.set_ylabel('corrXY\n(registration)')
+            ax.spines[['top', 'right']].set_visible(False)
+        axes[-1, 1].legend(loc='lower right', ncol=2, frameon=False, fontsize=8)
     for row, icell in enumerate(cells):
         ax_f, ax_d = axes[row]
         for t0, t1 in artifacts:
@@ -306,8 +398,10 @@ def plot_dff_check(F_raw, F_neu, F_cor, F0, dff, fs, save_path, cells, metrics=N
         ax_d.set_ylabel('dF/F0')
         if metrics is not None:
             m = metrics.iloc[icell]
-            ax_d.text(1.0, 1.0, f'SNR = {m.snr:.3g}   contamination = {m.contamination:.2f}',
-                      transform=ax_d.transAxes, ha='right', va='bottom', fontsize=9, color='#0b0b0b')
+            text = f'SNR = {m.snr:.3g}   contamination = {m.contamination:.2f}'
+            if 'motion_r' in m and np.isfinite(m.motion_r):
+                text += f'   motion_r = {m.motion_r:.2f}'
+            ax_d.text(1.0, 1.0, text, transform=ax_d.transAxes, ha='right', va='bottom', fontsize=9, color='#0b0b0b')
         for ax in (ax_f, ax_d):
             ax.spines[['top', 'right']].set_visible(False)
     if artifacts:
@@ -345,11 +439,15 @@ def find_suite2p_folders(experimenter, mice_ids, haas_path=False,
 
 
 def process_suite2p_folder(suite2p_folder, neuropil_coef=0.7, window=60, percentile=8, sigma=1, min_f0=1,
-                           artifact_merge_gap=2, artifact_pad=2, example_cells='quality', plot_duration=180,
-                           contamination_threshold=0.8):
+                           motion_threshold=0.7, motion_window=20,
+                           motion_merge_gap=0.2, motion_pad=0.25, example_cells='quality', plot_duration=180,
+                           contamination_threshold=0.8, neuropil_ratio_threshold=0.8):
     '''
     Compute and save F_cor, F0, dff, artifact frames, noise metrics and QC
     figures for a single suite2p output folder.
+    Artifact frames = frames where corrXY < motion_threshold x its rolling
+    median over motion_window s (merged motion_merge_gap, padded motion_pad).
+    motion_threshold None: no artifact frames.
     example_cells: dff_check cells, 'quality' (2 good, 2 median, 2 bad on snr
                    & contamination), 'random' or 'first'.
     '''
@@ -386,12 +484,23 @@ def process_suite2p_folder(suite2p_folder, neuropil_coef=0.7, window=60, percent
     F_neu = F_neu[iscell[:,0]==1.]
     log(f'Kept {F_raw.shape[0]} cells (iscell == 1).')
 
-    # Motion artifacts from suite2p badframes.
-    log('Detecting artifacts from suite2p badframes.')
-    badframes = np.asarray(ops.get('badframes', np.zeros(F_raw.shape[1], dtype=bool))).astype(bool)
-    bad_frames, n_artifacts = get_artifact_mask(badframes, fs=ops['fs'], merge_gap=artifact_merge_gap, pad=artifact_pad)
-    log(f'{n_artifacts} artifacts | suite2p bad frames: {badframes.sum()} ({100 * badframes.mean():.3f}%) '
-        f'| masked frames (merged + padded): {bad_frames.sum()} ({100 * bad_frames.mean():.3f}%)')
+    # Motion artifacts: drops of the registration correlation (corrXY). suite2p
+    # badframes are not used: they all fall inside these periods (checked on
+    # RD130/RD132/RD134, 147/147 frames) and would need their own padding.
+    bad_frames = np.zeros(F_raw.shape[1], dtype=bool)
+    corrXY = load_corrxy(suite2p_folder, ops)
+    if corrXY is not None and corrXY.size != F_raw.shape[1]:
+        log(f'corrXY has {corrXY.size} frames for {F_raw.shape[1]} imaging frames, ignored.')
+        corrXY = None
+    if corrXY is None:
+        log('No corrXY: motion detection and motion_r skipped, no artifact frames.')
+    elif motion_threshold is not None:
+        log('Detecting motion artifacts from corrXY.')
+        bad_frames, n_motion = get_artifact_mask(
+            get_motion_frames(corrXY, fs=ops['fs'], threshold=motion_threshold, window=motion_window),
+            fs=ops['fs'], merge_gap=motion_merge_gap, pad=motion_pad)
+        log(f'{n_motion} motion periods (corrXY < {motion_threshold} x local median): {bad_frames.sum()} frames '
+            f'({100 * bad_frames.mean():.1f}%)')
 
     log('Computing F_cor, F0 (rolling percentile) and dff.')
     # Without suffix: artifact frames kept. _masked: artifact frames set to NaN.
@@ -421,30 +530,37 @@ def process_suite2p_folder(suite2p_folder, neuropil_coef=0.7, window=60, percent
     metrics = pd.concat([compute_noise_metrics(F_cor_masked, dff_masked),
                          compute_contamination_metrics(F_raw, F_neu, fs=ops['fs'], neuropil_coef=neuropil_coef,
                                                        bad_frames=bad_frames)], axis=1)
+    metrics['motion_r'] = (compute_motion_r(dff, corrXY, fs=ops['fs']) if corrXY is not None
+                           else np.full(F_raw.shape[0], np.nan))
     metrics.insert(0, 'roi', np.where(iscell[:, 0] == 1.)[0])
     metrics.to_csv(os.path.join(suite2p_folder, 'noise_metrics.csv'), index_label='cell')
     # One (n_cells,) array per metric, same cell order as dff.
-    for col in ['noise_abs', 'noise_rel', 'snr', 'neuropil_ratio', 'neuropil_f_rho', 'contamination']:
+    for col in ['noise_abs', 'noise_rel', 'snr', 'neuropil_ratio', 'neuropil_f_rho', 'contamination', 'motion_r']:
         np.save(os.path.join(suite2p_folder, col), metrics[col].to_numpy())
     log(f'Median noise abs = {metrics.noise_abs.median():.3g} a.u. | noise rel = {metrics.noise_rel.median():.3g} '
         f'| SNR = {metrics.snr.median():.3g} | contamination = {metrics.contamination.median():.2f} '
-        f'({(metrics.contamination > contamination_threshold).sum()} cells > {contamination_threshold})')
+        f'({(metrics.contamination > contamination_threshold).sum()} cells > {contamination_threshold}) '
+        f'| |motion_r| > 0.5: {(metrics.motion_r.abs() > 0.5).sum()} cells')
 
     # Figures, same example cells in both.
     log('Plotting dff_check.png and noise_distributions.png.')
     cells, cell_labels = select_example_cells(metrics, mode=example_cells)
     plot_dff_check(F_raw, F_neu, F_cor, F0, dff_masked, fs=ops['fs'], cells=cells, cell_labels=cell_labels,
-                   duration=plot_duration, metrics=metrics,
-                   bad_frames=bad_frames, save_path=os.path.join(suite2p_folder, 'dff_check.png'))
+                   duration=plot_duration, metrics=metrics, corrXY=corrXY, motion_threshold=motion_threshold,
+                   motion_window=motion_window, bad_frames=bad_frames,
+                   save_path=os.path.join(suite2p_folder, 'dff_check.png'))
     plot_noise_distributions(metrics, cells=cells, contamination_threshold=contamination_threshold,
+                             neuropil_ratio_threshold=neuropil_ratio_threshold,
+                             artifacts=bad_frames, fs=ops['fs'],
                              neuropil_coef=neuropil_coef,
                              save_path=os.path.join(suite2p_folder, 'noise_distributions.png'))
     log(f'Done. Data saved: {suite2p_folder}')
 
 
 # Keys of the config's dff_updated: block passed to process_suite2p_folder.
-DFF_PARAMS = ['neuropil_coef', 'window', 'percentile', 'sigma', 'min_f0', 'artifact_merge_gap',
-              'artifact_pad', 'example_cells', 'plot_duration', 'contamination_threshold']
+DFF_PARAMS = ['neuropil_coef', 'window', 'percentile', 'sigma', 'min_f0',
+              'motion_threshold', 'motion_window', 'motion_merge_gap', 'motion_pad',
+              'example_cells', 'plot_duration', 'contamination_threshold', 'neuropil_ratio_threshold']
 
 
 def run_from_config(config):
