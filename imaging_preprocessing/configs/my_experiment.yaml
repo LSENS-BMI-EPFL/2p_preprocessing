@@ -1,0 +1,116 @@
+# Example run config for the 2P preprocessing pipeline.
+#
+# A single config drives all stages:
+#   python run_suite2p.py           --config configs/my_experiment.yaml   (suite2p env)
+#   python compute_dff_updated.py   --config configs/my_experiment.yaml   (suite2p env)
+#   python run_cascade_inference.py --config configs/my_experiment.yaml   (Cascade env, see README)
+#
+# compute_dff_updated.py is the dF/F script to use (reads the dff_updated:
+# block). compute_dff.py is the old method, kept for comparison (reads dff:).
+#
+# Copy this file, rename it per experiment, and edit the values. Nothing in the
+# Python scripts needs to change.
+
+# --- Who / what to process -------------------------------------------------
+experimenter: RD                 # initials, mapped to a folder via experimenter_map
+mice: [RD130, RD132, RD134]      # mice to process
+on_haas: true                    # true -> HAAS cluster mounts; false -> lab server
+
+# --- run_suite2p.py options ------------------------------------------------
+longitudinal: false              # true: concatenate all sessions, one run per mouse
+start_date:                      # skip sessions before this date (null to disable)
+session_to_do:                   # process only this exact session id (null = all)
+excluded_sessions:
+  - RD130_20261005_094915
+
+# Overrides layered on top of suite2p.default_settings(). Only list what you
+# change; nested keys (registration, detection, io) are merged, not replaced.
+suite2p_ops:
+  fs: 30
+  tau: 0.1                       # GCaMP8s timescale for deconvolution
+  io:
+    delete_bin: false
+  registration:
+    batch_size: 500
+    nimg_init: 400
+    reg_tif: true                # save registered tif for Fissa / NWB
+  detection:
+    threshold_scaling: 0.9
+    sparsery_settings:
+      max_ROIs: 1000
+
+# --- compute_dff_updated.py options ----------------------------------------
+dff_updated:
+  neuropil_coef: 0.7             # F_cor = F_raw - neuropil_coef * F_neu
+  window: 60                     # rolling F0 window (s), TOTAL width (not per side)
+  percentile: 8                  # percentile of F_cor taken as F0
+  sigma: 1                       # gaussian smoothing (s) applied before the percentile
+  min_f0: 1                      # floor on F0, avoids division by ~0
+  # Motion artifacts: frames whose registration correlation (corrXY) drops below
+  # motion_threshold x its rolling median (excluded from F0, NaN in *_masked,
+  # motion_artifacts intervals in the NWB). suite2p badframes are not used: they
+  # all fall inside these periods.
+  motion_threshold: 0.7          # null: no artifact detection
+  motion_window: 20              # rolling median window (s)
+  motion_merge_gap: 0.2          # motion frames closer than this (s) form one period
+  motion_pad: 0.1                # motion periods extended by this (s) on each side
+  example_cells: quality         # dff_check.png cells: quality, random or first
+  plot_duration: 180             # length (s) of the segment shown in dff_check.png
+  contamination_threshold: 0.8   # cells above are flagged in noise_distributions.png
+  neuropil_ratio_threshold: 0.8  # above: F_cor baseline collapsed. Line in noise_distributions.png, and these
+                                 # cells are left out of the CASCADE quantification figures (data kept)
+  overwrite: true                # recompute even if dff.npy already exists
+
+# --- run_cascade_inference.py options --------------------------------------
+# Runs in the Cascade env (CASCADE from git, python 3.7 / tensorflow 2.3),
+# not in the suite2p env. Reads dff.npy, which must be NaN-free.
+cascade:
+  # git clone of CASCADE, as seen from the machine running the script
+  # (e.g. a clone on the analysis share: /mnt/lsens-analysis/... on HAAS)
+  cascade_repo: /mnt/lsens-analysis/Robin_Dard/git_repos/Cascade
+  model_name: GC8s_EXC_30Hz_smoothing50ms_causalkernel  # downloaded on first use if missing
+  frame_rate: 30                 # Hz, must match the model (ops.npy is unreadable in the Cascade env)
+  overwrite: true                # true: rerun inference; false: reuse saved predictions (figures always redone)
+  # Quantification figures 
+  spike_exclusion_pad: 0         # spikes within this (s) of an artifact frame are left out (0: artifact frames only)
+  gap_s: 0.03                    # spiking frames closer than this (s) form one event
+  n_spikes_to_plot: [1, 2, 3, 5, 10, 20]
+  t_before: 0.2                  # dF/F window around the spike (s)
+  t_after: 1
+  clear_before: 0.5              # isolated frame: no other spike within this window (s)
+  clear_after: 0.5
+  n_single_examples: 3           # single responses per spike count in dff_single_by_n_spikes.png
+  n_example_cells: 5             # cells in example_cells_f_dff_rate_spikes.png
+  example_snr_min: 20            # on the snr.npy scale of compute_dff_updated (null: no cut)
+  example_first_cells: true      # true: first cells passing the cut; false: random
+  example_t_start: 600           # example traces window, s from imaging start
+  example_t_length: 60
+  seed: 0                        # random picks (single examples, random example cells)
+
+# --- compute_dff.py options (old method) -----------------------------------
+dff:
+  neuropil_coeff: 0.7           # F_cor = F_raw - neuropil_coeff * F_neu
+  window: 30                    # baseline window (s) on each side of a sample
+  sigma_win: 5                  # gaussian smoothing of the baseline (s)
+  overwrite: false              # recompute even if dff.npy already exists
+
+# --- Folder layout (defaults match the LSENS convention) -------------------
+# Change these only if your data is organised differently.
+folder_layout:
+  imaging_subpath: [Recording, Imaging]   # <data_root>/<mouse>/Recording/Imaging/<session>
+  suite2p_subpath: [suite2p, plane0]       # <analysis>/<mouse>/<session>/suite2p/plane0
+  session_date_format: "%Y%m%d"            # parsed from session_id.split('_')[1]
+
+# --- Storage roots (optional) ----------------------------------------------
+# Uncomment to point at a different server / local copy. Defaults are the
+# LSENS lab server and HAAS mounts defined in config.py.
+# paths:
+#   data_root: "//sv-nas1.rcp.epfl.ch/Petersen-Lab/data"
+#   data_root_haas: "/mnt/lsens-data"
+#   analysis_root: "//sv-nas1.rcp.epfl.ch/Petersen-Lab/analysis"
+#   analysis_root_haas: "/mnt/lsens-analysis"
+
+# --- Extra experimenters (optional) ----------------------------------------
+# Add lab members not already in config.py's EXPERIMENTER_MAP.
+# experimenter_map:
+#   XY: Firstname_Lastname

@@ -6,7 +6,7 @@ Preprocessing pipeline for 2-photon calcium imaging data (Suite2p extraction +
 ## Configuration
 
 Run parameters live in a **YAML config file** instead of being hardcoded in the
-scripts. Copy [`imaging_preprocessing/configs/example_run.yaml`](imaging_preprocessing/configs/example_run.yaml),
+scripts. Copy [`imaging_preprocessing/configs/my_experiment.yaml`](imaging_preprocessing/configs/my_experiment.yaml),
 edit it for your experiment, and pass it with `--config`:
 
 ```bash
@@ -43,7 +43,7 @@ same thing.
 | Neuropil correction | `F_cor = F - 0.7·Fneu`, clipped at 0 | `F_cor = F - 0.7·Fneu`, not clipped |
 | Baseline F0 | 1 Hz FIR lowpass → rolling min/max filter (`window` = 30 s **per side**) → gaussian smoothing (5 s) | gaussian smoothing (1 s) → rolling **8th percentile** (`window` = 60 s **total**) |
 | ΔF/F | `(F_cor − F0_cor) / F0_raw`: divided by the baseline of the **raw** trace | `(F_cor − F0) / F0`: divided by the baseline of the **neuropil-corrected** trace (F0 floored at 1) |
-| Motion artifacts | ignored | frames where the registration correlation `corrXY` drops below 0.7 × its 20 s rolling median (merged < 0.2 s, padded 0.25 s); excluded from F0 and set to NaN in `dff_masked.npy` / `F_cor_masked.npy` (same frames for every cell). suite2p `badframes` are not used: they all fall inside these periods |
+| Motion artifacts | ignored | frames where the registration correlation `corrXY` drops below 0.7 × its 20 s rolling median (merged < 0.2 s, padded 0.1 s: the disturbance fades 3-4 frames after the flagged frames whatever the period length); excluded from F0 and set to NaN in `dff_masked.npy` / `F_cor_masked.npy` (same frames for every cell). suite2p `badframes` are not used: they all fall inside these periods |
 | Merged ROIs | set to non-cell in memory only | set to non-cell and **written to `iscell.npy`** (original kept as `iscell_original.npy`) |
 | Saved traces | `F_raw`, `F_neu`, `F0_raw`, `F0_cor`, `dff` | `F_raw`, `F_neu`, `F_cor`, `F_cor_masked`, `F0`, `dff`, `dff_masked`, `artifact_frames` |
 | QC | none | `noise_metrics.csv` + one `.npy` per metric (`noise_abs`, `noise_rel`, `snr`, `neuropil_ratio`, `neuropil_f_rho`, `contamination`, `motion_r`), `dff_check.png`, `noise_distributions.png` |
@@ -59,8 +59,10 @@ Things to keep in mind when switching:
 - **suite2p `badframes` miss most motion artifacts.** Its `th_badframes` is
   normalized by the session's mean shift, so frequent jumps never stand out.
   The `corrXY` criterion (`motion_*` options) catches them, including every
-  suite2p bad frame. Share of frames masked: ~8-9% per session in RD130/RD132,
-  ~22% in RD134 (more task-evoked movement). Cells already deviate more than
+  suite2p bad frame. Share of frames masked with 0.1 s padding: ~5% in
+  RD130_20260929, ~18% in RD134_20260929 (more task-evoked movement); with
+  0.25 s padding the 38-session survey gave ~8-9% per session in RD130/RD132
+  and ~22% in RD134. Cells already deviate more than
   usual at corrXY 0.8-0.9 x local median, so 0.7 is not a strict threshold.
 - **Cell-level QC is decided at analysis, not here.** Every `iscell == 1` cell is
   kept. Useful cuts on the saved metrics:

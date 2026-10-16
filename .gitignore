@@ -6,6 +6,4 @@ __pycache__/
 
 *.log
 
-imaging_preprocessing/configs/my_experiment.yaml
-
-imaging_preprocessing/configs/example_run.yaml
+.claude/

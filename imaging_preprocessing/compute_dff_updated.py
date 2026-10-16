@@ -440,7 +440,7 @@ def find_suite2p_folders(experimenter, mice_ids, haas_path=False,
 
 def process_suite2p_folder(suite2p_folder, neuropil_coef=0.7, window=60, percentile=8, sigma=1, min_f0=1,
                            motion_threshold=0.7, motion_window=20,
-                           motion_merge_gap=0.2, motion_pad=0.25, example_cells='quality', plot_duration=180,
+                           motion_merge_gap=0.2, motion_pad=0.1, example_cells='quality', plot_duration=180,
                            contamination_threshold=0.8, neuropil_ratio_threshold=0.8):
     '''
     Compute and save F_cor, F0, dff, artifact frames, noise metrics and QC
