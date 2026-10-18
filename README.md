@@ -43,10 +43,10 @@ same thing.
 | Neuropil correction | `F_cor = F - 0.7·Fneu`, clipped at 0 | `F_cor = F - 0.7·Fneu`, not clipped |
 | Baseline F0 | 1 Hz FIR lowpass → rolling min/max filter (`window` = 30 s **per side**) → gaussian smoothing (5 s) | gaussian smoothing (1 s) → rolling **8th percentile** (`window` = 60 s **total**) |
 | ΔF/F | `(F_cor − F0_cor) / F0_raw`: divided by the baseline of the **raw** trace | `(F_cor − F0) / F0`: divided by the baseline of the **neuropil-corrected** trace (F0 floored at 1) |
-| Motion artifacts | ignored | frames where the registration correlation `corrXY` drops below 0.7 × its 20 s rolling median (merged < 0.2 s, padded 0.1 s: the disturbance fades 3-4 frames after the flagged frames whatever the period length); excluded from F0 and set to NaN in `dff_masked.npy` / `F_cor_masked.npy` (same frames for every cell). suite2p `badframes` are not used: they all fall inside these periods |
+| Motion artifacts | ignored | frames where the registration correlation `corrXY` drops below 0.7 × its 20 s rolling median (merged < 0.2 s, padded 0.1 s: the disturbance fades 3-4 frames after the flagged frames whatever the period length), plus sudden whole-FOV brightness steps > 1.5x (e.g. immersion water refilled, PMT settling): F0 lags them for half its window, so 30 s on the bright side is masked; excluded from F0 and set to NaN in `dff_masked.npy` / `F_cor_masked.npy` (same frames for every cell). suite2p `badframes` are not used: they all fall inside these periods |
 | Merged ROIs | set to non-cell in memory only | set to non-cell and **written to `iscell.npy`** (original kept as `iscell_original.npy`) |
 | Saved traces | `F_raw`, `F_neu`, `F0_raw`, `F0_cor`, `dff` | `F_raw`, `F_neu`, `F_cor`, `F_cor_masked`, `F0`, `dff`, `dff_masked`, `artifact_frames` |
-| QC | none | `noise_metrics.csv` + one `.npy` per metric (`noise_abs`, `noise_rel`, `snr`, `neuropil_ratio`, `neuropil_f_rho`, `contamination`, `motion_r`), `dff_check.png`, `noise_distributions.png` |
+| QC | none | `noise_metrics.csv` + one `.npy` per metric (`noise_abs`, `noise_rel`, `snr`, `neuropil_ratio`, `neuropil_ratio_max`, `neuropil_f_rho`, `contamination`, `motion_r`), `dff_check.png`, `noise_distributions.png` |
 
 Things to keep in mind when switching:
 
@@ -66,9 +66,13 @@ Things to keep in mind when switching:
   usual at corrXY 0.8-0.9 x local median, so 0.7 is not a strict threshold.
 - **Cell-level QC is decided at analysis, not here.** Every `iscell == 1` cell is
   kept. Useful cuts on the saved metrics:
-  - `neuropil_ratio` > ~0.8: neuropil subtraction removed most of the baseline,
-    F0 is tiny and dF/F explodes (single cells can produce most of a session's
-    "10-20 spike" events).
+  - `neuropil_ratio_max` > ~0.8: in at least one 60 s window, neuropil
+    subtraction removed most of the baseline, F0 drops to its floor and dF/F
+    explodes (single cells can produce most of a session's "10-20 spike"
+    events, at 10,000% dF/F). Use it rather than the session `neuropil_ratio`:
+    a cell whose neuropil ring brightens for a few minutes (e.g. an active
+    undetected neighbour) collapses there while its session median looks fine.
+    Such cells also get an inflated SNR, so a low-SNR cut does not remove them.
   - |`motion_r`| large: dF/F follows registration quality frame by frame, i.e. a
     motion artifact. Real population activity also lowers `corrXY`, so
     moderate values are ambiguous.
@@ -133,8 +137,9 @@ every later spike). Two things keep artifacts out:
 
 - Each cell's noise level, which selects the model ensemble and so calibrates
   the spike rate, is computed on `dff_masked.npy` (artifact frames ignored).
-- The quantification figures leave out cells with `neuropil_ratio` above
-  `dff_updated: neuropil_ratio_threshold` (0.8): their collapsed baseline makes
+- The quantification figures leave out cells with `neuropil_ratio_max` above
+  `dff_updated: neuropil_ratio_threshold` (0.8) or `contamination` above
+  `dff_updated: contamination_threshold` (0.8): a collapsed baseline makes
   dF/F explode, and a single such cell can dominate the large-event averages.
   Their spikes are still inferred and saved.
 - The quantification leaves out spikes on artifact frames, plus

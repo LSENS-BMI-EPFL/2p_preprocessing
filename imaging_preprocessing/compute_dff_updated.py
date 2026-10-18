@@ -68,6 +68,36 @@ def get_motion_frames(corrXY, fs, threshold=0.7, window=20):
     return corrXY < threshold * local
 
 
+def get_brightness_step_frames(F_raw, fs, threshold=1.5, window=60):
+    '''
+    Frames affected by sudden whole-FOV brightness steps (e.g. immersion water
+    refilled): population median F changing by more than threshold x between
+    the 1 s before and the 1 s after a frame. The rolling F0 (centered, window
+    s, low percentile) follows the dim side of a step and inflates every
+    cell's dF/F on the bright side for about window / 2: after an upward step
+    (water refilled), before a downward one (e.g. PMT settling at the start).
+    That side is masked, plus 1 s on the other side.
+    Returns the boolean frame mask and the step times (s).
+    '''
+    pop = np.median(F_raw, axis=0).astype(float)
+    w = max(1, int(round(fs)))
+    csum = np.r_[0, np.cumsum(pop)]
+    i = np.arange(w, pop.size - w)
+    ratio = ((csum[i + w] - csum[i]) / w) / ((csum[i] - csum[i - w]) / w)
+    big = i[(ratio > threshold) | (ratio < 1 / threshold)]
+    mask = np.zeros(pop.size, dtype=bool)
+    steps = []
+    for group in np.split(big, np.flatnonzero(np.diff(big) > 5 * w) + 1) if big.size else []:
+        step = group[np.argmax(np.abs(np.log(ratio[group - w])))]
+        half = int(round(window / 2 * fs))
+        if ratio[step - w] > 1:  # brighter after: F0 lags after the step
+            mask[max(0, step - w):step + half] = True
+        else:                    # dimmer after: F0 is pulled down before the step
+            mask[max(0, step - half):step + w] = True
+        steps.append(step / fs)
+    return mask, steps
+
+
 def compute_motion_r(traces, corrXY, fs, detrend=10):
     '''
     Per-cell correlation between traces (dff: the analysed trace, after
@@ -181,11 +211,18 @@ def compute_noise_metrics(F_cor, dff, snr_percentile=99.9):
     return pd.DataFrame({'noise_abs': noise_abs, 'noise_rel': noise_rel, 'snr': snr})
 
 
-def compute_contamination_metrics(F_raw, F_neu, fs, neuropil_coef=0.7, bad_frames=None, band=(0.5, 30)):
+def compute_contamination_metrics(F_raw, F_neu, fs, neuropil_coef=0.7, bad_frames=None, band=(0.5, 30),
+                                  ratio_window=60):
     '''
     Per-cell neuropil contamination metrics.
     neuropil_ratio: neuropil_coef * median(Fneu) / median(F), share of the
                     baseline removed by neuropil subtraction (>= 1: F_cor <= 0).
+    neuropil_ratio_max: the same ratio in non-overlapping ratio_window (s)
+                    windows, worst window. Catches cells whose baseline
+                    collapses for a while (e.g. their neuropil ring brightens
+                    for minutes), which the session median misses: F0 then
+                    drops to its floor and dF/F explodes. Windows with less
+                    than half good frames are skipped.
     neuropil_f_rho: correlation of F and Fneu fluctuations, band-passed between
                    band[0] and band[1] seconds (removes frame noise and slow drift).
     contamination: neuropil_ratio * neuropil_f_rho. ~0: clean, > ~0.8: F is
@@ -194,6 +231,18 @@ def compute_contamination_metrics(F_raw, F_neu, fs, neuropil_coef=0.7, bad_frame
     '''
     good = slice(None) if bad_frames is None else ~bad_frames
     ratio = neuropil_coef * np.median(F_neu[:, good], axis=1) / np.median(F_raw[:, good], axis=1)
+
+    win = int(round(ratio_window * fs))
+    n_win = F_raw.shape[1] // win
+    ratio_max = np.full(F_raw.shape[0], np.nan)
+    if n_win:
+        ok = np.ones(n_win * win, dtype=bool) if bad_frames is None else ~bad_frames[:n_win * win]
+        windows = [np.flatnonzero(ok[w * win:(w + 1) * win]) + w * win for w in range(n_win)]
+        windows = [w for w in windows if w.size >= win / 2]
+        if windows:
+            local = np.stack([neuropil_coef * np.median(F_neu[:, w], axis=1) / np.median(F_raw[:, w], axis=1)
+                              for w in windows], axis=1)
+            ratio_max = local.max(axis=1)
 
     def bandpass(x):
         x = x.astype(np.float32)
@@ -205,15 +254,22 @@ def compute_contamination_metrics(F_raw, F_neu, fs, neuropil_coef=0.7, bad_frame
     Nb -= Nb.mean(axis=1, keepdims=True)
     corr = (Fb * Nb).sum(axis=1) / np.sqrt((Fb ** 2).sum(axis=1) * (Nb ** 2).sum(axis=1))
 
-    return pd.DataFrame({'neuropil_ratio': ratio, 'neuropil_f_rho': corr, 'contamination': ratio * corr})
+    return pd.DataFrame({'neuropil_ratio': ratio, 'neuropil_ratio_max': ratio_max, 'neuropil_f_rho': corr,
+                         'contamination': ratio * corr})
 
 
-def select_example_cells(metrics, mode='quality', n_cells=6):
+def select_example_cells(metrics, mode='quality', n_cells=6, neuropil_ratio_threshold=0.8,
+                         contamination_threshold=0.8):
     '''
     Cells shown in dff_check. Returns (cells, labels).
     mode='quality': n_cells // 3 good, median and bad cells. Quality score =
         mean of the percentile ranks of snr (high = good) and contamination
-        (low = good). Ordered good -> median -> bad.
+        (low = good). Cells with neuropil_ratio_max (neuropil_ratio for older
+        metrics) above neuropil_ratio_threshold or contamination above
+        contamination_threshold (flagged) are never good or median, and come
+        first among the bad ones: a collapsed baseline inflates snr and keeps
+        contamination low, so the score alone ranks them as good.
+        Ordered good -> median -> bad.
     mode='random': random cells. mode='first': the first n_cells.
     '''
     n_total = len(metrics)
@@ -225,10 +281,15 @@ def select_example_cells(metrics, mode='quality', n_cells=6):
         return np.arange(n_cells), [''] * n_cells
 
     score = (metrics.snr.rank(pct=True) + (1 - metrics.contamination.rank(pct=True))).to_numpy() / 2
+    ratio = metrics.neuropil_ratio_max if 'neuropil_ratio_max' in metrics else metrics.neuropil_ratio
+    flagged = ((ratio > neuropil_ratio_threshold) | (metrics.contamination > contamination_threshold)).to_numpy()
     order = np.argsort(-score)  # best first
+    kept, worst = order[~flagged[order]], order[flagged[order]][::-1]
     k = max(1, n_cells // 3)
-    mid = n_total // 2
-    good, median, bad = order[:k], order[mid - k // 2: mid - k // 2 + k], order[-k:]
+    mid = len(kept) // 2
+    good, median = kept[:k], kept[mid - k // 2: mid - k // 2 + k]
+    # Bad: flagged cells first (worst score first), then the worst of the others.
+    bad = np.concatenate([worst, kept[::-1]])[:k][::-1]
     cells = np.concatenate([good, median, bad])
     labels = ['good'] * len(good) + ['median'] * len(median) + ['bad'] * len(bad)
     return cells, labels
@@ -316,8 +377,13 @@ def plot_noise_distributions(metrics, save_path, cells=None, contamination_thres
                   label=f'contamination > {contamination_threshold} ({high.sum()} cells)')
     ax_rc.axvline(neuropil_ratio_threshold, color='#e34948', lw=1, ls='--',
                   label=f'neuropil ratio > {neuropil_ratio_threshold} ({(ratio > neuropil_ratio_threshold).sum()} cells)')
+    if 'neuropil_ratio_max' in metrics:
+        # Cells whose worst 60 s window crosses the threshold although the session ratio does not.
+        local = (metrics.neuropil_ratio_max.to_numpy() > neuropil_ratio_threshold) & (ratio <= neuropil_ratio_threshold)
+        ax_rc.scatter(ratio[local], corr[local], s=60, marker='s', facecolors='none', edgecolors='#eb6834', lw=1.2,
+                      label=f'only neuropil_ratio_max > {neuropil_ratio_threshold} ({local.sum()} cells)')
     fig.colorbar(sc, ax=ax_rc, label='log10 SNR')
-    ax_rc.set_xlabel(f'neuropil ratio  {neuropil_coef:g}·Fneu / F (baseline)')
+    ax_rc.set_xlabel(f'neuropil ratio  {neuropil_coef:g}·Fneu / F (session baseline)')
     ax_rc.set_ylabel('neuropil_f_rho  corr(F, Fneu), 0.5-30 s')
 
     ax_cs.scatter(contamination, snr, s=14, color='#2a78d6')
@@ -440,14 +506,16 @@ def find_suite2p_folders(experimenter, mice_ids, haas_path=False,
 
 def process_suite2p_folder(suite2p_folder, neuropil_coef=0.7, window=60, percentile=8, sigma=1, min_f0=1,
                            motion_threshold=0.7, motion_window=20,
-                           motion_merge_gap=0.2, motion_pad=0.1, example_cells='quality', plot_duration=180,
+                           motion_merge_gap=0.2, motion_pad=0.1, brightness_step_threshold=1.5,
+                           example_cells='quality', plot_duration=180,
                            contamination_threshold=0.8, neuropil_ratio_threshold=0.8):
     '''
     Compute and save F_cor, F0, dff, artifact frames, noise metrics and QC
     figures for a single suite2p output folder.
     Artifact frames = frames where corrXY < motion_threshold x its rolling
-    median over motion_window s (merged motion_merge_gap, padded motion_pad).
-    motion_threshold None: no artifact frames.
+    median over motion_window s (merged motion_merge_gap, padded motion_pad),
+    plus whole-FOV brightness steps > brightness_step_threshold x (1 s before
+    to window / 2 after each step, where F0 lags). None disables either.
     example_cells: dff_check cells, 'quality' (2 good, 2 median, 2 bad on snr
                    & contamination), 'random' or 'first'.
     '''
@@ -502,6 +570,16 @@ def process_suite2p_folder(suite2p_folder, neuropil_coef=0.7, window=60, percent
         log(f'{n_motion} motion periods (corrXY < {motion_threshold} x local median): {bad_frames.sum()} frames '
             f'({100 * bad_frames.mean():.1f}%)')
 
+    # Whole-FOV brightness steps (immersion water refill): F0 lags for window / 2.
+    if brightness_step_threshold is not None:
+        step_frames, steps = get_brightness_step_frames(F_raw, fs=ops['fs'], threshold=brightness_step_threshold,
+                                                        window=window)
+        if steps:
+            bad_frames = bad_frames | step_frames
+            log(f'{len(steps)} brightness step(s) > {brightness_step_threshold}x at '
+                f'{", ".join(f"{t:.0f} s" for t in steps)}: {step_frames.sum()} frames masked | '
+                f'all artifact frames: {100 * bad_frames.mean():.1f}%')
+
     log('Computing F_cor, F0 (rolling percentile) and dff.')
     # Without suffix: artifact frames kept. _masked: artifact frames set to NaN.
     F_cor, F0, dff = compute_dff(F_raw, F_neu, fs=ops['fs'], neuropil_coef=neuropil_coef, window=window,
@@ -529,22 +607,27 @@ def process_suite2p_folder(suite2p_folder, neuropil_coef=0.7, window=60, percent
     log('Computing noise and contamination metrics.')
     metrics = pd.concat([compute_noise_metrics(F_cor_masked, dff_masked),
                          compute_contamination_metrics(F_raw, F_neu, fs=ops['fs'], neuropil_coef=neuropil_coef,
-                                                       bad_frames=bad_frames)], axis=1)
+                                                       bad_frames=bad_frames, ratio_window=window)], axis=1)
     metrics['motion_r'] = (compute_motion_r(dff, corrXY, fs=ops['fs']) if corrXY is not None
                            else np.full(F_raw.shape[0], np.nan))
     metrics.insert(0, 'roi', np.where(iscell[:, 0] == 1.)[0])
     metrics.to_csv(os.path.join(suite2p_folder, 'noise_metrics.csv'), index_label='cell')
     # One (n_cells,) array per metric, same cell order as dff.
-    for col in ['noise_abs', 'noise_rel', 'snr', 'neuropil_ratio', 'neuropil_f_rho', 'contamination', 'motion_r']:
+    for col in ['noise_abs', 'noise_rel', 'snr', 'neuropil_ratio', 'neuropil_ratio_max', 'neuropil_f_rho',
+                'contamination', 'motion_r']:
         np.save(os.path.join(suite2p_folder, col), metrics[col].to_numpy())
     log(f'Median noise abs = {metrics.noise_abs.median():.3g} a.u. | noise rel = {metrics.noise_rel.median():.3g} '
         f'| SNR = {metrics.snr.median():.3g} | contamination = {metrics.contamination.median():.2f} '
         f'({(metrics.contamination > contamination_threshold).sum()} cells > {contamination_threshold}) '
+        f'| neuropil_ratio_max > {neuropil_ratio_threshold}: '
+        f'{(metrics.neuropil_ratio_max > neuropil_ratio_threshold).sum()} cells '
         f'| |motion_r| > 0.5: {(metrics.motion_r.abs() > 0.5).sum()} cells')
 
     # Figures, same example cells in both.
     log('Plotting dff_check.png and noise_distributions.png.')
-    cells, cell_labels = select_example_cells(metrics, mode=example_cells)
+    cells, cell_labels = select_example_cells(metrics, mode=example_cells,
+                                              neuropil_ratio_threshold=neuropil_ratio_threshold,
+                                              contamination_threshold=contamination_threshold)
     plot_dff_check(F_raw, F_neu, F_cor, F0, dff_masked, fs=ops['fs'], cells=cells, cell_labels=cell_labels,
                    duration=plot_duration, metrics=metrics, corrXY=corrXY, motion_threshold=motion_threshold,
                    motion_window=motion_window, bad_frames=bad_frames,
@@ -559,7 +642,7 @@ def process_suite2p_folder(suite2p_folder, neuropil_coef=0.7, window=60, percent
 
 # Keys of the config's dff_updated: block passed to process_suite2p_folder.
 DFF_PARAMS = ['neuropil_coef', 'window', 'percentile', 'sigma', 'min_f0',
-              'motion_threshold', 'motion_window', 'motion_merge_gap', 'motion_pad',
+              'motion_threshold', 'motion_window', 'motion_merge_gap', 'motion_pad', 'brightness_step_threshold',
               'example_cells', 'plot_duration', 'contamination_threshold', 'neuropil_ratio_threshold']
 
 

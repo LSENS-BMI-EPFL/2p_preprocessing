@@ -54,11 +54,16 @@ dff_updated:
   motion_window: 20              # rolling median window (s)
   motion_merge_gap: 0.2          # motion frames closer than this (s) form one period
   motion_pad: 0.1                # motion periods extended by this (s) on each side
+  brightness_step_threshold: 1.5 # whole-FOV brightness steps above this ratio within 1 s (water refill, PMT
+                                 # settling): window/2 on the bright side, where F0 lags, is masked. null: off
   example_cells: quality         # dff_check.png cells: quality, random or first
   plot_duration: 180             # length (s) of the segment shown in dff_check.png
-  contamination_threshold: 0.8   # cells above are flagged in noise_distributions.png
-  neuropil_ratio_threshold: 0.8  # above: F_cor baseline collapsed. Line in noise_distributions.png, and these
-                                 # cells are left out of the CASCADE quantification figures (data kept)
+  contamination_threshold: 0.8   # cells above are flagged in noise_distributions.png and, like those above
+                                 # neuropil_ratio_threshold, never shown as good/median examples in
+                                 # dff_check.png and left out of the CASCADE quantification figures
+  neuropil_ratio_threshold: 0.8  # applied to neuropil_ratio_max (worst `window` s of the session): above, the
+                                 # F_cor baseline collapses at least once. These cells are never good/median
+                                 # examples in dff_check.png and are left out of the CASCADE figures (data kept)
   overwrite: true                # recompute even if dff.npy already exists
 
 # --- run_cascade_inference.py options --------------------------------------

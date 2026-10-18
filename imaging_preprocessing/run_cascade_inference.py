@@ -351,9 +351,12 @@ def quantify(raw_traces, traces, rate, spikes, imaging_rate, save_folder, sessio
 
 
 def process_suite2p_folder(suite2p_folder, model_name, model_folder, frame_rate, cascade_funcs, overwrite=False,
-                           spike_exclusion_pad=0.0, neuropil_ratio_threshold=0.8, **quant_params):
-    # neuropil_ratio_threshold: cells above (collapsed F_cor baseline, exploding dF/F) are left out of the
-    # quantification figures. Their spikes are still inferred and saved.
+                           spike_exclusion_pad=0.0, neuropil_ratio_threshold=0.8, contamination_threshold=0.8,
+                           **quant_params):
+    # Cells with neuropil_ratio_max > neuropil_ratio_threshold (F_cor baseline collapsed, at least for one
+    # 60 s window: exploding dF/F) or
+    # contamination > contamination_threshold are left out of the quantification figures. Their spikes are
+    # still inferred and saved.
     # spike_exclusion_pad: spikes within this many seconds of an artifact frame are left out of the
     # quantification (CASCADE looks at +-32 frames, so nearby predictions can be affected).
     tqdm.write(f'\nProcessing {suite2p_folder}.')
@@ -400,13 +403,22 @@ def process_suite2p_folder(suite2p_folder, model_name, model_folder, frame_rate,
     del dff_masked
 
     excluded_cells = None
-    ratio_path = os.path.join(suite2p_folder, 'neuropil_ratio.npy')
-    if neuropil_ratio_threshold is not None and os.path.exists(ratio_path):
-        ratio = np.load(ratio_path)
-        if ratio.size == dff.shape[0]:
-            excluded_cells = ratio > neuropil_ratio_threshold
-            log(f'{excluded_cells.sum()} cells with neuropil_ratio > {neuropil_ratio_threshold} left out of the '
-                f'quantification: {np.flatnonzero(excluded_cells)}')
+    # neuropil_ratio_max (worst 60 s window) when available, else the session neuropil_ratio (older outputs).
+    ratio_metric = ('neuropil_ratio_max' if os.path.exists(os.path.join(suite2p_folder, 'neuropil_ratio_max.npy'))
+                    else 'neuropil_ratio')
+    for metric, threshold in [(ratio_metric, neuropil_ratio_threshold),
+                              ('contamination', contamination_threshold)]:
+        path = os.path.join(suite2p_folder, f'{metric}.npy')
+        if threshold is None or not os.path.exists(path):
+            continue
+        values = np.load(path)
+        if values.size != dff.shape[0]:
+            continue
+        above = values > threshold
+        excluded_cells = above if excluded_cells is None else excluded_cells | above
+        log(f'{above.sum()} cells with {metric} > {threshold}: {np.flatnonzero(above)}')
+    if excluded_cells is not None:
+        log(f'{excluded_cells.sum()} cells left out of the quantification.')
 
     log('Plotting quantification figures.')
     # CASCADE output is expected spikes per frame: x frame rate gives spk/s.
@@ -425,6 +437,7 @@ QUANT_PARAMS = ['gap_s', 'n_spikes_to_plot', 't_before', 't_after', 'clear_befor
 def run_from_config(config):
     # Spike inference + quantification for all requested mice/sessions, from the cascade: block.
     cfg = config.get('cascade') or {}
+    dff_cfg = config.get('dff_updated') or {}  # QC thresholds shared with compute_dff_updated
     layout = config.get('folder_layout') or {}
     unknown = set(cfg) - set(QUANT_PARAMS) - {'cascade_repo', 'model_name', 'frame_rate', 'overwrite',
                                                'spike_exclusion_pad'}
@@ -456,8 +469,8 @@ def run_from_config(config):
         process_suite2p_folder(suite2p_folder, model_name, model_folder, frame_rate, cascade_funcs,
                                overwrite=cfg.get('overwrite', False),
                                spike_exclusion_pad=cfg.get('spike_exclusion_pad', 0.0),
-                               neuropil_ratio_threshold=(config.get('dff_updated') or {}).get(
-                                   'neuropil_ratio_threshold', 0.8), **params)
+                               neuropil_ratio_threshold=dff_cfg.get('neuropil_ratio_threshold', 0.8),
+                               contamination_threshold=dff_cfg.get('contamination_threshold', 0.8), **params)
 
 
 if __name__ == '__main__':
