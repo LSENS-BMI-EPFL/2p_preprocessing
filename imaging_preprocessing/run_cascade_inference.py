@@ -21,6 +21,10 @@ import argparse
 import os
 import sys
 import time
+import warnings
+# TensorFlow start-up messages (CUDA libraries not found, CPU instructions, XLA) are harmless on CPU:
+# silence them. Must be set before tensorflow is imported (through cascade2p).
+os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
@@ -36,6 +40,10 @@ def import_cascade(cascade_repo):
     # so the working directory is moved there, as in the CASCADE demos.
     sys.path.insert(0, cascade_repo)
     os.chdir(cascade_repo)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', category=FutureWarning)  # numpy / tensorflow 2.3 deprecation notices
+        import tensorflow as tf
+    tf.get_logger().setLevel('ERROR')
     from cascade2p import cascade
     from cascade2p.utils import plot_noise_level_distribution, plot_noise_matched_ground_truth
     from cascade2p.utils_discrete_spikes import infer_discrete_spikes
@@ -75,15 +83,28 @@ def window_any(mask, before, after):
     return csum[np.clip(t + after + 1, 0, mask.size)] - csum[np.clip(t - before, 0, mask.size)] > 0
 
 
-def extract_snippets(traces, onsets_per_cell, pre, post):
-    """Dff snippets around onsets (one array of onset frames per cell), baseline-subtracted on the pre-onset window."""
+def extract_snippets(traces, onsets_per_cell, pre, post, subtract_baseline=True):
+    """Snippets around onsets (one array of onset frames per cell), baseline-subtracted on the pre-onset window
+    unless subtract_baseline is False (e.g. for the inferred rate)."""
     snippets = np.array([traces[cell, onset - pre:onset + post]
                          for cell, onsets in enumerate(onsets_per_cell)
                          for onset in onsets
                          if onset - pre >= 0 and onset + post <= traces.shape[1]])
-    if len(snippets) and pre > 0:
+    if len(snippets) and pre > 0 and subtract_baseline:
         snippets = snippets - np.nanmean(snippets[:, :pre], axis=1, keepdims=True)
     return snippets
+
+
+def finish_rate_axes(rate_axes, color='tab:blue'):
+    # Same rate scale on every panel's second y-axis, legend on the first.
+    if not rate_axes:
+        return
+    top = max(a.get_ylim()[1] for a in rate_axes)
+    for a in rate_axes:
+        a.set_ylim(0, top)
+        a.tick_params(axis='y', colors=color, labelsize=7)
+        a.set_ylabel('inferred rate (spk/s)', color=color, fontsize=7)
+    rate_axes[0].legend(frameon=False, fontsize=8, loc='center right')
 
 
 def save_figure(fig, save_folder, name):
@@ -139,7 +160,8 @@ def run_inference(dff, model_name, model_folder, frame_rate, save_folder, cascad
 
 
 def quantify(raw_traces, traces, rate, spikes, imaging_rate, save_folder, session_id, neuron_snr=None,
-             artifacts=None, unreliable=None, excluded_cells=None,
+             artifacts=None, unreliable=None, excluded_cells=None, noise_rel=None, min_events_per_cell=3,
+             detection_threshold_sd=3, log=print,
              gap_s=0.03, n_spikes_to_plot=(1, 2, 3, 5, 10, 20), t_before=0.2, t_after=1,
              clear_before=0.5, clear_after=0.5, n_single_examples=3, n_example_cells=5, example_snr_min=None,
              example_first_cells=True, example_t_start=180, example_t_length=60, seed=0):
@@ -150,6 +172,10 @@ def quantify(raw_traces, traces, rate, spikes, imaging_rate, save_folder, sessio
     unreliable: frames whose spikes are unreliable (on or near an artifact). Events
                 whose dF/F or clear window contains such a frame are left out.
     excluded_cells: bool per cell, cells left out of every figure (e.g. collapsed baseline).
+    noise_rel: per-cell frame noise (dF/F fraction, noise_rel.npy), for the per-cell peak / noise.
+    min_events_per_cell: isolated events a cell needs for a given n to enter the per-cell figures and table.
+    detection_threshold_sd: peak / noise_rel an isolated event needs; the smallest such spike count per cell
+        is saved as min_detectable_spikes (csv column and .npy).
     Time is frames / imaging_rate, 0 at imaging start.
     '''
     rng = np.random.default_rng(seed)
@@ -184,6 +210,10 @@ def quantify(raw_traces, traces, rate, spikes, imaging_rate, save_folder, sessio
     # Per-cell histogram: occurrences of n-spike events (n >= 1)
     max_n = max(1, max((e.max() for e in events_n_spikes if e.size), default=1))
     cell_hists = np.array([np.bincount(e, minlength=max_n + 1)[1:] for e in events_n_spikes])
+    totals = cell_hists.sum(axis=0)
+    log(f'QC events (spiking frames < {gap_s} s apart merged, artifact windows left out): {totals.sum()} events | '
+        + ', '.join(f'{n} spk: {totals[n - 1]}' for n in n_spikes_to_plot if n <= max_n)
+        + f' | largest event {max_n} spikes')
 
     # Figure: histogram summed over all cells
     fig, ax = plt.subplots(figsize=(5, 4))
@@ -203,11 +233,14 @@ def quantify(raw_traces, traces, rate, spikes, imaging_rate, save_folder, sessio
     isolated = (n_active_in_window == 1) & usable[None, :]
     iso_onsets = {n: [np.flatnonzero((spikes[cell] == n) & isolated[cell]) for cell in range(traces.shape[0])]
                   for n in n_spikes_to_plot}
+    log(f'QC isolated frames (no other spike within -{clear_before}/+{clear_after} s): '
+        + ', '.join(f'{n} spk: {sum(o.size for o in iso_onsets[n])}' for n in n_spikes_to_plot))
 
     # Single isolated responses: n_single_examples random events per n spikes, before averaging
     fig, axes = plt.subplots(len(n_spikes_to_plot), n_single_examples,
-                             figsize=(2.8 * n_single_examples, 2.2 * len(n_spikes_to_plot)),
+                             figsize=(3.4 * n_single_examples, 2.2 * len(n_spikes_to_plot)),
                              sharex=True, sharey='row', squeeze=False)
+    single_rate_axes = []
     for row, n in enumerate(n_spikes_to_plot):
         # (cell, onset) of isolated n-spike frames with a full, NaN-free window
         candidates = [(cell, onset) for cell, onsets in enumerate(iso_onsets[n]) for onset in onsets
@@ -235,12 +268,17 @@ def quantify(raw_traces, traces, rate, spikes, imaging_rate, save_folder, sessio
             spk = window_counts > 0
             ax.vlines(t[spk], 0, 0.04 * window_counts[spk], color='tab:blue', lw=1.5,
                       transform=ax.get_xaxis_transform())
+            # Inferred rate of this cell around this event, on a second y-axis.
+            ax_r = ax.twinx()
+            ax_r.plot(t, rate[cell, onset - pre:onset + post], color='tab:green', lw=1, label='inferred rate')
+            single_rate_axes.append(ax_r)
             ax.set_title(f'cell {cell} - t = {onset / imaging_rate:.1f} s', fontsize=8)
         axes[row, 0].set_ylabel(f'{n} spike(s)\ndF/F % (bs)')
+    finish_rate_axes(single_rate_axes, color='tab:green')
     for ax in axes[-1]:
         ax.set_xlabel('Time from spike (s)')
     axes[0, 0].legend(frameon=False, fontsize=7, loc='upper right')
-    fig.suptitle(f'{session_id} - single isolated responses (spikes in blue)')
+    fig.suptitle(f'{session_id} - single isolated responses (spikes in blue, inferred rate in green)')
     save_figure(fig, save_folder, 'dff_single_by_n_spikes')
 
     # Dff average traces for single spike event, two-spike events, 3-spike events, 5, 10, 20 grid figure
@@ -252,6 +290,7 @@ def quantify(raw_traces, traces, rate, spikes, imaging_rate, save_folder, sessio
         ax.set_visible(False)
 
     iso_peaks = []  # (n, peak amplitude, sem at peak) for isolated frames
+    rate_axes = []  # second y-axis per panel: mean inferred rate around isolated frames
     for ax, n in zip(axes.flat, n_spikes_to_plot):
         all_onsets = [events_onset[cell][events_n_spikes[cell] == n] for cell in range(traces.shape[0])]
         ax.axvline(0, color='grey', ls='--', lw=0.8)
@@ -266,7 +305,12 @@ def quantify(raw_traces, traces, rate, spikes, imaging_rate, save_folder, sessio
                 if label == 'isolated frames':
                     peak_idx = pre + np.nanargmax(mean[pre:])  # peak of the average after onset
                     iso_peaks.append((n, mean[peak_idx], sem[peak_idx]))
+                    rate_snips = extract_snippets(rate, onsets, pre, post, subtract_baseline=False)
+                    ax_r = ax.twinx()
+                    ax_r.plot(t, np.nanmean(rate_snips, axis=0), color='tab:blue', lw=1, label='inferred rate')
+                    rate_axes.append(ax_r)
         ax.set_title(f'{n} spike(s) - {n_ev[0]} all / {n_ev[1]} isolated', fontsize=9)
+    finish_rate_axes(rate_axes)
     axes.flat[0].legend(frameon=False, fontsize=8)
     for i, ax in enumerate(axes.flat[:len(n_spikes_to_plot)]):
         if i + n_cols >= len(n_spikes_to_plot):  # no visible panel below
@@ -283,6 +327,8 @@ def quantify(raw_traces, traces, rate, spikes, imaging_rate, save_folder, sessio
         slope = np.sum(n_arr * amp) / np.sum(n_arr ** 2)
         ss_tot = np.sum((amp - amp.mean()) ** 2)
         r2 = 1 - np.sum((amp - slope * n_arr) ** 2) / ss_tot if ss_tot > 0 else np.nan
+        log('QC pooled isolated peaks: ' + ', '.join(f'{n} spk {a:.0f}%' for n, a in zip(n_arr, amp))
+            + f' | fit through origin {slope:.1f} % / spike, R2 = {r2:.2f}')
         fig, ax = plt.subplots(figsize=(4, 4))
         ax.errorbar(n_arr, amp, yerr=amp_sem, fmt='o', color='tab:red', capsize=3)
         x_fit = np.array([0, n_arr.max()])
@@ -297,6 +343,111 @@ def quantify(raw_traces, traces, rate, spikes, imaging_rate, save_folder, sessio
         ax.set_title(session_id, fontsize=9)
         save_figure(fig, save_folder, 'dff_linearity_isolated')
 
+    # Per-cell responses to isolated n-spike frames: average per cell first (cells with >= min_events_per_cell
+    # events), then statistics across cells, so cells with many events do not dominate.
+    from scipy import stats
+    import pandas as pd
+    per_cell, rows = {}, []
+    for n in n_spikes_to_plot:
+        cells_n, means_n, rates_n = [], [], []
+        for cell, onsets in enumerate(iso_onsets[n]):
+            snip = extract_snippets(traces[cell:cell + 1], [onsets], pre, post)
+            if len(snip) < min_events_per_cell:
+                continue
+            mean = np.nanmean(snip, axis=0)
+            peak = float(np.nanmax(mean[pre:]))  # % dF/F, peak of the cell average after onset
+            cells_n.append(cell)
+            means_n.append(mean)
+            rates_n.append(np.nanmean(extract_snippets(rate[cell:cell + 1], [onsets], pre, post,
+                                                       subtract_baseline=False), axis=0))
+            rows.append(dict(cell=cell, n_spikes=n, n_events=len(snip), peak_dff_pct=peak,
+                             peak_over_noise=peak / 100 / noise_rel[cell] if noise_rel is not None else np.nan))
+        per_cell[n] = (np.array(cells_n), np.array(means_n), np.array(rates_n))
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(3.3 * n_cols, 3 * n_rows), sharex=True, sharey=True,
+                             squeeze=False)
+    for ax in axes.flat[len(n_spikes_to_plot):]:
+        ax.set_visible(False)
+    rate_axes = []
+    for ax, n in zip(axes.flat, n_spikes_to_plot):
+        cells_n, means_n, rates_n = per_cell[n]
+        ax.axvline(0, color='grey', ls='--', lw=0.8)
+        if len(cells_n):
+            mean = np.nanmean(means_n, axis=0)
+            ax.plot(t, mean, color='tab:red', label='ΔdF/F')
+            if len(cells_n) > 1:
+                ci = stats.t.ppf(0.975, len(cells_n) - 1) * np.nanstd(means_n, axis=0, ddof=1) / np.sqrt(len(cells_n))
+                ax.fill_between(t, mean - ci, mean + ci, color='tab:red', alpha=0.3)
+            ax_r = ax.twinx()
+            ax_r.plot(t, np.nanmean(rates_n, axis=0), color='tab:blue', lw=1, label='inferred rate')
+            rate_axes.append(ax_r)
+        ax.set_title(f'{n} spike(s) - {len(cells_n)} cells', fontsize=9)
+    finish_rate_axes(rate_axes)
+    for i, ax in enumerate(axes.flat[:len(n_spikes_to_plot)]):
+        if i + n_cols >= len(n_spikes_to_plot):
+            ax.set_xlabel('Time from event onset (s)')
+            ax.xaxis.set_tick_params(labelbottom=True)
+    for ax in axes[:, 0]:
+        ax.set_ylabel('ΔdF/F % (baseline-subtracted)')
+    fig.suptitle(f'{session_id} - isolated frames, mean of cell averages ± 95% CI across cells '
+                 f'(cells with >= {min_events_per_cell} events)', fontsize=9)
+    save_figure(fig, save_folder, 'dff_avg_by_n_spikes_per_cell')
+
+    if rows:
+        df = pd.DataFrame(rows)
+        # One row per cell, columns per n: n_events_<n>, peak_dff_pct_<n>, peak_over_noise_<n>.
+        wide = df.pivot(index='cell', columns='n_spikes', values=['n_events', 'peak_dff_pct', 'peak_over_noise'])
+        wide.columns = [f'{v}_{n}' for v, n in wide.columns]
+
+        # QC: smallest measured spike count whose isolated-event peak reaches detection_threshold_sd x noise_rel.
+        # NaN: excluded cell, or no measured count reaches it (no extrapolation).
+        reached = df[df.peak_over_noise >= detection_threshold_sd].groupby('cell').n_spikes.min()
+        wide['min_detectable_spikes'] = reached.reindex(wide.index)
+        g = df.groupby('n_spikes')
+        log(f'QC per cell (>= {min_events_per_cell} isolated events): '
+            + ', '.join(f'{n} spk: {int(g.size()[n])} cells, median peak {g.peak_dff_pct.median()[n]:.0f}% = '
+                        f'{g.peak_over_noise.median()[n]:.1f} noise SD' for n in g.size().index))
+        mds = wide.min_detectable_spikes
+        log(f'QC min_detectable_spikes (peak >= {detection_threshold_sd} noise SD): '
+            + ', '.join(f'{int(n)}: {int((mds == n).sum())}' for n in sorted(mds.dropna().unique()))
+            + f', not reached: {int(mds.isna().sum())} cells')
+        wide.to_csv(os.path.join(save_folder, 'per_cell_spike_amplitude.csv'))
+        np.save(os.path.join(save_folder, 'min_detectable_spikes.npy'),
+                reached.reindex(np.arange(traces.shape[0])).to_numpy(dtype=float))
+
+        if noise_rel is not None:
+            ns_all = [n for n in n_spikes_to_plot]
+            counts = [int((wide.min_detectable_spikes == n).sum()) for n in ns_all]
+            not_reached = int(wide.min_detectable_spikes.isna().sum())
+            fig, ax = plt.subplots(figsize=(1.2 * len(ns_all) + 2.5, 4))
+            labels = [str(n) for n in ns_all] + ['not\nreached']
+            bars = ax.bar(labels, counts + [not_reached], color=['tab:blue'] * len(ns_all) + ['grey'])
+            total = sum(counts) + not_reached
+            for b, c in zip(bars, counts + [not_reached]):
+                ax.annotate(f'{c}\n({100 * c / total:.0f}%)', (b.get_x() + b.get_width() / 2, c), ha='center',
+                            va='bottom', fontsize=8)
+            ax.set_xlabel(f'min_detectable_spikes (isolated-event peak >= {detection_threshold_sd} x noise_rel)')
+            ax.set_ylabel('cells')
+            ax.spines[['top', 'right']].set_visible(False)
+            ax.set_title(f'{session_id} - {total} cells with isolated events (>= {min_events_per_cell} per n)',
+                         fontsize=9)
+            save_figure(fig, save_folder, 'min_detectable_spikes')
+
+        ns = [n for n in n_spikes_to_plot if (df.n_spikes == n).any()]
+        fig, axes = plt.subplots(1, 2, figsize=(4 + 1.1 * len(ns), 4.5), squeeze=False)
+        for ax, col, label in [(axes[0, 0], 'peak_dff_pct', 'Peak ΔdF/F (%) of the cell average'),
+                               (axes[0, 1], 'peak_over_noise', 'Peak / noise_rel (noise SDs)')]:
+            data = [df.loc[df.n_spikes == n, col].dropna().to_numpy() for n in ns]
+            ax.boxplot(data, labels=[f'{n}\n({len(x)})' for n, x in zip(ns, data)], showfliers=True,
+                       flierprops=dict(markersize=3))
+            ax.set_xlabel('Spikes in isolated frame (cells)')
+            ax.set_ylabel(label)
+            ax.spines[['top', 'right']].set_visible(False)
+        axes[0, 1].axhline(3, color='grey', ls='--', lw=0.8)
+        fig.suptitle(f'{session_id} - per-cell peak response (cells with >= {min_events_per_cell} events)',
+                     fontsize=9)
+        save_figure(fig, save_folder, 'dff_peak_by_n_spikes_per_cell')
+
     # Example df/f traces with rate and spike count, cells passing the SNR cut (snr.npy from compute_dff_updated)
     if neuron_snr is not None and example_snr_min is not None:
         candidates = np.flatnonzero(neuron_snr >= example_snr_min)
@@ -310,6 +461,7 @@ def quantify(raw_traces, traces, rate, spikes, imaging_rate, save_folder, sessio
         example_cells = candidates[:n_example_cells]
     else:
         example_cells = rng.choice(candidates, size=min(n_example_cells, candidates.size), replace=False)
+    log(f'QC example cells ({snr_label}): {list(example_cells)}')
     if example_cells.size == 0:
         return
 
@@ -381,6 +533,10 @@ def process_suite2p_folder(suite2p_folder, model_name, model_folder, frame_rate,
     if neuron_snr is not None and neuron_snr.size != dff.shape[0]:
         log(f'snr.npy has {neuron_snr.size} values for {dff.shape[0]} cells, ignored.')
         neuron_snr = None
+    noise_path = os.path.join(suite2p_folder, 'noise_rel.npy')
+    noise_rel = np.load(noise_path) if os.path.exists(noise_path) else None
+    if noise_rel is not None and noise_rel.size != dff.shape[0]:
+        noise_rel = None
     log(f'{dff.shape[0]} cells x {dff.shape[1]} frames ({dff.shape[1] / frame_rate / 60:.1f} min at {frame_rate} Hz).')
 
     # Artifact frames from compute_dff_updated (suite2p badframes + motion), absent for older outputs.
@@ -424,14 +580,14 @@ def process_suite2p_folder(suite2p_folder, model_name, model_folder, frame_rate,
     # CASCADE output is expected spikes per frame: x frame rate gives spk/s.
     quantify(F_raw, dff * 100, spike_prob * frame_rate, spikes, frame_rate, save_folder, session_id,
              neuron_snr=neuron_snr, artifacts=artifacts, unreliable=unreliable, excluded_cells=excluded_cells,
-             **quant_params)
+             noise_rel=noise_rel, log=log, **quant_params)
     log(f'Done. Data saved: {save_folder}')
 
 
 # Keys of the config's cascade: block passed to quantify.
 QUANT_PARAMS = ['gap_s', 'n_spikes_to_plot', 't_before', 't_after', 'clear_before', 'clear_after',
                 'n_single_examples', 'n_example_cells', 'example_snr_min', 'example_first_cells',
-                'example_t_start', 'example_t_length', 'seed']
+                'example_t_start', 'example_t_length', 'seed', 'min_events_per_cell', 'detection_threshold_sd']
 
 
 def run_from_config(config):

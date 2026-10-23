@@ -75,7 +75,7 @@ cascade:
   cascade_repo: /mnt/lsens-analysis/Robin_Dard/git_repos/Cascade
   model_name: GC8s_EXC_30Hz_smoothing50ms_causalkernel  # downloaded on first use if missing
   frame_rate: 30                 # Hz, must match the model (ops.npy is unreadable in the Cascade env)
-  overwrite: true                # true: rerun inference; false: reuse saved predictions (figures always redone)
+  overwrite: false               # true: rerun inference; false: reuse saved predictions (figures always redone)
   # Quantification figures 
   spike_exclusion_pad: 0         # spikes within this (s) of an artifact frame are left out (0: artifact frames only)
   gap_s: 0.03                    # spiking frames closer than this (s) form one event
@@ -85,8 +85,10 @@ cascade:
   clear_before: 0.5              # isolated frame: no other spike within this window (s)
   clear_after: 0.5
   n_single_examples: 3           # single responses per spike count in dff_single_by_n_spikes.png
+  min_events_per_cell: 3         # isolated events a cell needs for a given spike count in the per-cell figures/table
+  detection_threshold_sd: 3      # min_detectable_spikes: smallest spike count whose isolated-event peak >= this x noise_rel
   n_example_cells: 5             # cells in example_cells_f_dff_rate_spikes.png
-  example_snr_min: 20            # on the snr.npy scale of compute_dff_updated (null: no cut)
+  example_snr_min: 10            # on the snr.npy scale of compute_dff_updated (99th pct, null: no cut)
   example_first_cells: true      # true: first cells passing the cut; false: random
   example_t_start: 600           # example traces window, s from imaging start
   example_t_length: 60

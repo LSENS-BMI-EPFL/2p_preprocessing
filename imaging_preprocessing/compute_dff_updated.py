@@ -195,24 +195,25 @@ def frame_noise(x):
     return np.nanmedian(np.abs(np.diff(x, axis=1)), axis=1) / (0.6745 * np.sqrt(2))
 
 
-def compute_noise_metrics(F_cor, dff, snr_percentile=99.9):
+def compute_noise_metrics(F_cor, dff, snr_percentile=99):
     '''
     Per-cell noise metrics.
     noise_abs: frame noise of F_cor (a.u.)
     noise_rel: frame noise of dff (dF/F0 units, i.e. noise relative to baseline)
-    snr: high percentile of dff (largest transients) / noise_rel. 99.9 rather
-         than 99 so it reflects transient amplitude more than how often the
-         cell is active.
+    snr: high percentile of dff (large transients) / noise_rel. 99th rather
+         than 99.9th: set by the top 1% of frames (~1,500 in a session) instead
+         of the top 0.1% (~150), so a few extreme events weigh less. A pure-noise
+         trace gives ~2.3.
     '''
     noise_abs = frame_noise(F_cor)
     noise_rel = frame_noise(dff)
-    snr = np.nanpercentile(dff, snr_percentile, axis=1) / noise_rel
+    snr = np.nanpercentile(dff, snr_percentile, axis=1) / noise_rel  # NaN frames (artifacts, collapse) ignored
 
     return pd.DataFrame({'noise_abs': noise_abs, 'noise_rel': noise_rel, 'snr': snr})
 
 
 def compute_contamination_metrics(F_raw, F_neu, fs, neuropil_coef=0.7, bad_frames=None, band=(0.5, 30),
-                                  ratio_window=60):
+                                  ratio_window=60, collapse_threshold=None):
     '''
     Per-cell neuropil contamination metrics.
     neuropil_ratio: neuropil_coef * median(Fneu) / median(F), share of the
@@ -228,6 +229,8 @@ def compute_contamination_metrics(F_raw, F_neu, fs, neuropil_coef=0.7, bad_frame
     contamination: neuropil_ratio * neuropil_f_rho. ~0: clean, > ~0.8: F is
                    mostly neuropil (likely not a usable cell).
     Bad frames are excluded.
+    If collapse_threshold is given, also returns a (n_cells, n_frames) bool
+    mask of the windows where a cell's ratio exceeds it (baseline collapsed).
     '''
     good = slice(None) if bad_frames is None else ~bad_frames
     ratio = neuropil_coef * np.median(F_neu[:, good], axis=1) / np.median(F_raw[:, good], axis=1)
@@ -235,6 +238,7 @@ def compute_contamination_metrics(F_raw, F_neu, fs, neuropil_coef=0.7, bad_frame
     win = int(round(ratio_window * fs))
     n_win = F_raw.shape[1] // win
     ratio_max = np.full(F_raw.shape[0], np.nan)
+    collapse = np.zeros(F_raw.shape, dtype=bool) if collapse_threshold is not None else None
     if n_win:
         ok = np.ones(n_win * win, dtype=bool) if bad_frames is None else ~bad_frames[:n_win * win]
         windows = [np.flatnonzero(ok[w * win:(w + 1) * win]) + w * win for w in range(n_win)]
@@ -243,6 +247,11 @@ def compute_contamination_metrics(F_raw, F_neu, fs, neuropil_coef=0.7, bad_frame
             local = np.stack([neuropil_coef * np.median(F_neu[:, w], axis=1) / np.median(F_raw[:, w], axis=1)
                               for w in windows], axis=1)
             ratio_max = local.max(axis=1)
+            if collapse is not None:
+                for k, w in enumerate(windows):
+                    cells = local[:, k] > collapse_threshold
+                    if cells.any():
+                        collapse[np.ix_(cells, np.arange(w[0], w[-1] + 1))] = True
 
     def bandpass(x):
         x = x.astype(np.float32)
@@ -254,8 +263,9 @@ def compute_contamination_metrics(F_raw, F_neu, fs, neuropil_coef=0.7, bad_frame
     Nb -= Nb.mean(axis=1, keepdims=True)
     corr = (Fb * Nb).sum(axis=1) / np.sqrt((Fb ** 2).sum(axis=1) * (Nb ** 2).sum(axis=1))
 
-    return pd.DataFrame({'neuropil_ratio': ratio, 'neuropil_ratio_max': ratio_max, 'neuropil_f_rho': corr,
-                         'contamination': ratio * corr})
+    metrics = pd.DataFrame({'neuropil_ratio': ratio, 'neuropil_ratio_max': ratio_max, 'neuropil_f_rho': corr,
+                            'contamination': ratio * corr})
+    return metrics if collapse is None else (metrics, collapse)
 
 
 def select_example_cells(metrics, mode='quality', n_cells=6, neuropil_ratio_threshold=0.8,
@@ -296,24 +306,22 @@ def select_example_cells(metrics, mode='quality', n_cells=6, neuropil_ratio_thre
 
 
 def plot_noise_distributions(metrics, save_path, cells=None, contamination_threshold=0.8, neuropil_ratio_threshold=0.8,
-                             neuropil_coef=0.7, artifacts=None, fs=None):
+                             neuropil_coef=0.7, artifacts=None, fs=None, title=None,
+                             snr_label='SNR (99th pct of dF/F0 / noise rel)'):
     '''
-    Top: histograms of noise_rel, snr, contamination and motion_r across cells
-    (noise_abs is saved but not plotted).
-    Bottom: neuropil ratio vs neuropil_f_rho colored by SNR, SNR vs contamination,
-    and, if artifacts (bool per frame) and fs are given, the distribution of
-    artifact period lengths with the share of the session masked.
+    One row per concern (noise_abs is saved but not plotted):
+    Noise / signal: histograms of noise_rel and snr.
+    Neuropil: contamination histogram, neuropil ratio vs neuropil_f_rho colored
+        by SNR, neuropil ratio vs noise_rel, SNR vs contamination.
+    Movement: motion_r histogram and, if artifacts (bool per frame) and fs are
+        given, the distribution of artifact period lengths with the share of
+        the session masked.
     `cells` (indices) are marked so they can be matched with the dff_check figure.
     '''
-    columns = [('noise_rel', 'relative noise (dF/F0)'),
-               ('snr', 'SNR (99.9th pct of dF/F0 / noise rel)'),
-               ('contamination', 'contamination (neuropil ratio x corr)')]
-    if 'motion_r' in metrics and metrics.motion_r.notna().any():
-        columns.append(('motion_r', 'motion_r  corr(dF/F0, corrXY), drift removed'))
-    fig = plt.figure(figsize=(4.5 * len(columns), 9))
-    gs = fig.add_gridspec(2, len(columns), height_ratios=[1, 1.4])
-    axes = [fig.add_subplot(gs[0, i]) for i in range(len(columns))]
-    for ax, (col, label) in zip(axes, columns):
+    fig = plt.figure(figsize=(22, 16))
+    gs = fig.add_gridspec(3, 4, height_ratios=[1, 1.3, 1])
+
+    def histogram(ax, col, label):
         values = metrics[col].to_numpy()
         if col == 'motion_r':
             xmin, xmax = -1, 1
@@ -335,39 +343,46 @@ def plot_noise_distributions(metrics, save_path, cells=None, contamination_thres
                 ax.axvline(x, color='#eb6834', lw=1)
                 ax.text(x, 0.97 - 0.08 * (k % 4), f' {icell}', transform=ax.get_xaxis_transform(),
                         ha='left', va='top', fontsize=7, color='#52514e')
+            ax.plot([], [], color='#eb6834', lw=1, label='cells in dff_check')
+            ax.plot([], [], color='#0b0b0b', lw=1.5, ls='--', label='median')
+            ax.legend(loc='center right', frameon=False, fontsize=8)
         ax.set_xlabel(label)
         ax.set_ylabel('cells')
         ax.spines[['top', 'right']].set_visible(False)
-    ax_cont = axes[[col for col, _ in columns].index('contamination')]
-    if cells is not None:
-        ax_cont.plot([], [], color='#eb6834', lw=1, label='cells in dff_check')
-        ax_cont.plot([], [], color='#0b0b0b', lw=1.5, ls='--', label='median')
-        ax_cont.legend(loc='center right', frameon=False, fontsize=8)
-    ax_cont.axvline(contamination_threshold, color='#e34948', lw=1, ls=':')
 
-    # Contamination scatters.
+    # Row 1: noise / signal.
+    ax_noise, ax_snr = fig.add_subplot(gs[0, :2]), fig.add_subplot(gs[0, 2:])
+    histogram(ax_noise, 'noise_rel', 'relative noise (dF/F0)')
+    histogram(ax_snr, 'snr', snr_label)
+
+    # Row 2: neuropil.
+    ax_cont, ax_rc, ax_rn, ax_cs = (fig.add_subplot(gs[1, i]) for i in range(4))
+    histogram(ax_cont, 'contamination', 'contamination (neuropil ratio x corr)')
+    ax_cont.axvline(contamination_threshold, color='#e34948', lw=1, ls=':')
     ratio, corr = metrics.neuropil_ratio.to_numpy(), metrics.neuropil_f_rho.to_numpy()
     contamination, snr = metrics.contamination.to_numpy(), metrics.snr.to_numpy()
     high = contamination > contamination_threshold
-    ax_rc = fig.add_subplot(gs[1, :2])
-    plot_artifacts = artifacts is not None and fs is not None and len(columns) > 3
-    ax_cs = fig.add_subplot(gs[1, 2:-1] if plot_artifacts else gs[1, 2:])
 
+    # Row 3: movement.
+    plot_motion = 'motion_r' in metrics and metrics.motion_r.notna().any()
+    plot_artifacts = artifacts is not None and fs is not None
+    if plot_motion:
+        histogram(fig.add_subplot(gs[2, :2]), 'motion_r', 'motion_r  corr(dF/F0, corrXY), drift removed')
     if plot_artifacts:
         # Artifact periods: length distribution and share of the session masked.
-        ax_art = fig.add_subplot(gs[1, -1])
+        ax_art = fig.add_subplot(gs[2, 2:])
         labels, n_periods = scipy.ndimage.label(artifacts)
         lengths = np.bincount(labels.ravel())[1:] / fs
         total = artifacts.sum()
-        title = (f'{n_periods} artifact periods, {total} frames\n'
+        art_title = (f'{n_periods} artifact periods, {total} frames\n'
                  f'= {100 * total / artifacts.size:.1f}% of session ({total / fs / 60:.1f} min)')
         if n_periods:
             ax_art.hist(lengths, bins=np.logspace(np.log10(lengths.min()), np.log10(lengths.max() + 1e-9), 30),
                         color='#898781', edgecolor='#fcfcfb', linewidth=0.5)
             ax_art.set_xscale('log')
             ax_art.axvline(np.median(lengths), color='#0b0b0b', lw=1.5, ls='--')
-            title += f'\nmedian length {np.median(lengths):.2f} s'
-        ax_art.set_title(title, fontsize=8, color='#52514e')
+            art_title += f'\nmedian length {np.median(lengths):.2f} s'
+        ax_art.set_title(art_title, fontsize=8, color='#52514e')
         ax_art.set_xlabel('artifact period length (s)')
         ax_art.set_ylabel('periods')
         ax_art.spines[['top', 'right']].set_visible(False)
@@ -386,6 +401,17 @@ def plot_noise_distributions(metrics, save_path, cells=None, contamination_thres
     ax_rc.set_xlabel(f'neuropil ratio  {neuropil_coef:g}·Fneu / F (session baseline)')
     ax_rc.set_ylabel('neuropil_f_rho  corr(F, Fneu), 0.5-30 s')
 
+    # Relative noise vs neuropil ratio: neuropil subtraction lowers F0 but keeps the neuropil's photon noise,
+    # so noise relative to the baseline is expected to grow with the share of the baseline removed.
+    noise_rel = metrics.noise_rel.to_numpy()
+    ax_rn.scatter(ratio, noise_rel, s=14, color='#2a78d6')
+    ax_rn.set_yscale('log')
+    ax_rn.axvline(neuropil_ratio_threshold, color='#e34948', lw=1, ls='--')
+    rho = pd.Series(ratio).corr(pd.Series(noise_rel), method='spearman')
+    ax_rn.set_title(f'Spearman rho = {rho:.2f}', fontsize=8, color='#52514e')
+    ax_rn.set_xlabel(f'neuropil ratio  {neuropil_coef:g}·Fneu / F (session baseline)')
+    ax_rn.set_ylabel('relative noise (dF/F0)')
+
     ax_cs.scatter(contamination, snr, s=14, color='#2a78d6')
     ax_cs.set_yscale('log')
     ax_cs.axvline(contamination_threshold, color='#e34948', lw=1, ls=':')
@@ -393,23 +419,32 @@ def plot_noise_distributions(metrics, save_path, cells=None, contamination_thres
     ax_cs.set_ylabel('SNR')
 
     if cells is not None:
-        for ax, (x, y) in [(ax_rc, (ratio, corr)), (ax_cs, (contamination, snr))]:
+        for ax, (x, y) in [(ax_rc, (ratio, corr)), (ax_rn, (ratio, noise_rel)), (ax_cs, (contamination, snr))]:
             ax.scatter(x[cells], y[cells], s=60, marker='D', facecolors='none', edgecolors='#eb6834', lw=1.5,
                        label='cells in dff_check')
             for icell in cells:
                 ax.annotate(str(icell), (x[icell], y[icell]), xytext=(5, 5), textcoords='offset points',
                             fontsize=8, color='#0b0b0b')
-    for ax in (ax_rc, ax_cs):
-        ax.legend(frameon=False, fontsize=8, loc='upper left')
+    for ax in (ax_rc, ax_rn, ax_cs):
+        ax.legend(frameon=False, fontsize=7, loc='upper left')
         ax.spines[['top', 'right']].set_visible(False)
 
-    fig.tight_layout()
+    if title:
+        fig.suptitle(title, fontsize=13)
+    fig.tight_layout(rect=(0.025, 0, 1, 1))
+    # Row labels in the left margin, centred on each row.
+    rows = [(0, 'NOISE / SIGNAL'), (1, 'NEUROPIL')] + ([(2, 'MOVEMENT')] if plot_motion or plot_artifacts else [])
+    for row, name in rows:
+        box = gs[row, 0].get_position(fig)
+        fig.text(0.006, (box.y0 + box.y1) / 2, name, rotation=90, ha='left', va='center', fontsize=12,
+                 fontweight='bold', color='#52514e')
     fig.savefig(save_path, dpi=150)
     plt.close(fig)
 
 
 def plot_dff_check(F_raw, F_neu, F_cor, F0, dff, fs, save_path, cells, metrics=None, bad_frames=None,
-                   duration=300, seed=None, cell_labels=None, corrXY=None, motion_threshold=None, motion_window=20):
+                   duration=300, seed=None, cell_labels=None, corrXY=None, motion_threshold=None, motion_window=20,
+                   title=None):
     '''
     Plot F, Fneu, F_cor, F0 (left) and dff (right) for the given cells
     over a random segment of `duration` seconds. If metrics is given, the
@@ -477,6 +512,8 @@ def plot_dff_check(F_raw, F_neu, F_cor, F0, dff, fs, save_path, cells, metrics=N
     axes[0, 1].set_title('dF/F0', pad=14)
     axes[-1, 0].set_xlabel('time (s)')
     axes[-1, 1].set_xlabel('time (s)')
+    if title:
+        fig.suptitle(title, fontsize=12)
     fig.tight_layout()
     fig.savefig(save_path, dpi=150)
     plt.close(fig)
@@ -605,9 +642,16 @@ def process_suite2p_folder(suite2p_folder, neuropil_coef=0.7, window=60, percent
 
     # Noise metrics, on artifact-free traces. roi = index in the full suite2p roi list.
     log('Computing noise and contamination metrics.')
-    metrics = pd.concat([compute_noise_metrics(F_cor_masked, dff_masked),
-                         compute_contamination_metrics(F_raw, F_neu, fs=ops['fs'], neuropil_coef=neuropil_coef,
-                                                       bad_frames=bad_frames, ratio_window=window)], axis=1)
+    contamination, collapse = compute_contamination_metrics(
+        F_raw, F_neu, fs=ops['fs'], neuropil_coef=neuropil_coef, bad_frames=bad_frames, ratio_window=window,
+        collapse_threshold=neuropil_ratio_threshold if neuropil_ratio_threshold is not None else np.inf)
+    # Noise and SNR without each cell's collapsed windows (F0 at its floor there inflates the SNR percentile).
+    log(f'{collapse.any(axis=1).sum()} cells have collapsed windows: those frames ({100 * collapse.mean():.2f}% of '
+        f'all cell x frames) are left out of their noise and SNR; the cells are kept.')
+    nan = np.float32(np.nan)  # keeps the float32 copies at half the memory
+    metrics = pd.concat([compute_noise_metrics(np.where(collapse, nan, F_cor_masked),
+                                               np.where(collapse, nan, dff_masked)), contamination], axis=1)
+    del collapse
     metrics['motion_r'] = (compute_motion_r(dff, corrXY, fs=ops['fs']) if corrXY is not None
                            else np.full(F_raw.shape[0], np.nan))
     metrics.insert(0, 'roi', np.where(iscell[:, 0] == 1.)[0])
@@ -625,17 +669,19 @@ def process_suite2p_folder(suite2p_folder, neuropil_coef=0.7, window=60, percent
 
     # Figures, same example cells in both.
     log('Plotting dff_check.png and noise_distributions.png.')
+    # <mouse>/<session>/suite2p/plane0 -> session id, written on both figures.
+    session_id = os.path.basename(os.path.dirname(os.path.dirname(os.path.normpath(suite2p_folder))))
     cells, cell_labels = select_example_cells(metrics, mode=example_cells,
                                               neuropil_ratio_threshold=neuropil_ratio_threshold,
                                               contamination_threshold=contamination_threshold)
     plot_dff_check(F_raw, F_neu, F_cor, F0, dff_masked, fs=ops['fs'], cells=cells, cell_labels=cell_labels,
                    duration=plot_duration, metrics=metrics, corrXY=corrXY, motion_threshold=motion_threshold,
-                   motion_window=motion_window, bad_frames=bad_frames,
+                   motion_window=motion_window, bad_frames=bad_frames, title=session_id,
                    save_path=os.path.join(suite2p_folder, 'dff_check.png'))
     plot_noise_distributions(metrics, cells=cells, contamination_threshold=contamination_threshold,
                              neuropil_ratio_threshold=neuropil_ratio_threshold,
                              artifacts=bad_frames, fs=ops['fs'],
-                             neuropil_coef=neuropil_coef,
+                             neuropil_coef=neuropil_coef, title=session_id,
                              save_path=os.path.join(suite2p_folder, 'noise_distributions.png'))
     log(f'Done. Data saved: {suite2p_folder}')
 
