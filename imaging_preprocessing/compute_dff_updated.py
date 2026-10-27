@@ -145,6 +145,10 @@ def compute_baseline(F, fs, window=60, percentile=8, sigma=1, bad_frames=None):
     # The window shrinks at the edges of the recording.
     size = int(round(window * fs)) | 1  # Odd size so the window is centered.
     F0 = pd.DataFrame(F_smooth.T).rolling(size, center=True, min_periods=1).quantile(percentile / 100)
+    # Frames whose whole window is bad frames (artifact longer than window) get
+    # no F0: interpolated linearly from the F0 on both sides, so dff stays
+    # NaN-free (needed by CASCADE).
+    F0 = F0.interpolate(axis=0, limit_direction='both')
 
     return F0.to_numpy().T
 
