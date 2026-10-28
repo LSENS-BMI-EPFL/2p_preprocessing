@@ -66,11 +66,11 @@ def find_suite2p_folders(experimenter, mice_ids, haas_path=False, suite2p_subpat
 
 def spike_counts_per_frame(spike_frames, n_frames):
     # Discrete spike frame indices (one array per cell) -> spike count per frame.
-    # infer_discrete_spikes returns frames 1 too early (offset = first non-NaN frame - 1),
-    # hence the +1, as in the NWB conversion.
+    # No offset correction: CASCADE fixed its 1-frame offset upstream (issue #90, Oct 2026).
+    # Spikes inferred with an older CASCADE are 1 frame early: rerun inference.
     counts = np.zeros((len(spike_frames), n_frames), dtype=int)
     for cell, frames in enumerate(spike_frames):
-        frames = np.round(np.asarray(frames, dtype=float)).astype(int) + 1
+        frames = np.round(np.asarray(frames, dtype=float)).astype(int)
         frames = frames[(frames >= 0) & (frames < n_frames)]
         counts[cell] = np.bincount(frames, minlength=n_frames)
     return counts

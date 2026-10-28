@@ -128,14 +128,20 @@ Outputs go to `<suite2p folder>/<model_name>/`:
 | File | Content |
 |---|---|
 | `spike_rate_prediction.npy` | CASCADE output, expected spikes **per frame** (× frame rate = spk/s), NaN at the edges |
-| `discrete_spikes.npy` | object array, spike frame indices per cell, as returned by CASCADE: **1 frame early**, add 1 (`allow_pickle=True`) |
-| `spike_counts.npy` | discrete spikes binned per frame, `(n_cells, n_frames)` int, 1-frame offset corrected |
+| `discrete_spikes.npy` | object array, spike frame indices per cell, as returned by CASCADE (`allow_pickle=True`) |
+| `spike_counts.npy` | discrete spikes binned per frame, `(n_cells, n_frames)` int |
 | `noise_level_distribution.png`, `noise_matched_ground_truth.png` | CASCADE QC for model choice |
 | `n_spikes_events_hist.png` | events per spike count (spiking frames < `gap_s` apart are merged) |
 | `dff_single_by_n_spikes.png` | single ΔF/F responses to isolated frames, `n_single_examples` per spike count, with the mean overlaid |
 | `dff_avg_by_n_spikes.png` | mean ± sem ΔF/F, all events vs isolated frames |
 | `dff_linearity_isolated.png` | peak ΔF/F vs spike count, fit through the origin |
 | `example_cells_f_dff_rate_spikes.png` | F raw, ΔF/F, rate and spike counts for example cells (`snr.npy` ≥ `example_snr_min`) |
+
+**CASCADE version.** Use a CASCADE clone from 27 Oct 2026 or later. Before that,
+rates came out 1 frame early and discrete spikes were fitted with a symmetric
+kernel instead of the model's causal one (upstream issues #89, #90); the
+pipeline used to add 1 frame to the discrete spikes, and no longer does.
+Predictions made with an older clone must be redone (`overwrite: true`).
 
 The quantification doesn't need NWB. Time is frame index / frame rate, with
 0 at imaging start. Saved predictions are reused unless `overwrite: true`.
