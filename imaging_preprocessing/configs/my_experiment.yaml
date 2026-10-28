@@ -64,6 +64,14 @@ dff_updated:
   neuropil_ratio_threshold: 0.8  # applied to neuropil_ratio_max (worst `window` s of the session): above, the
                                  # F_cor baseline collapses at least once. These cells are never good/median
                                  # examples in dff_check.png and are left out of the CASCADE figures (data kept)
+  # Registered-movie clips (reg_tif) saved to suite2p/plane0/calcium_movie_snippets:
+  # <session>_movement_example_<i>.tiff around motion periods, <session>_stable_example_<i>.tiff without artifacts
+  movie_snippets: true           # false: no clips
+  snippet_n_movement: 8          # motion clips, from the strongest to the mildest artifact
+  snippet_n_stable: 2            # artifact-free clips
+  snippet_t_before: 1.5          # s shown before / after each motion period
+  snippet_t_after: 1.5
+  snippet_max_frames: 300        # max clip length (frames), also the length of stable clips
   overwrite: true                # recompute even if dff.npy already exists
 
 # --- run_cascade_inference.py options --------------------------------------

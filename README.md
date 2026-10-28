@@ -78,6 +78,16 @@ Things to keep in mind when switching:
     moderate values are ambiguous.
   - `contamination` = `neuropil_ratio` × `neuropil_f_rho` is negative when F and
     F_neu are anticorrelated (often motion), so check `neuropil_ratio` as well.
+- **Movie snippets** (`movie_snippets: true`): short clips of the registered
+  movie (`reg_tif`) are saved to `suite2p/plane0/calcium_movie_snippets/`.
+  `<session>_movement_example_<i>.tiff` (`snippet_n_movement`, default 8) covers a
+  motion period from `snippet_t_before` s before to `snippet_t_after` s after,
+  at most `snippet_max_frames` (300) frames. Periods are picked evenly from the
+  deepest to the mildest `corrXY` drop. `<session>_stable_example_<i>.tiff`
+  (`snippet_n_stable`, default 2) is a 300-frame stretch with no artifact
+  frame. `snippets.csv` gives the frame range of each clip. Frames are mapped
+  to the tif files with `reg_tif/movie_specs.yaml` if present, else with the
+  registration `batch_size` in `ops.npy`. Snippets are redone on every run.
 - `F0_raw.npy` and `F0_cor.npy` are no longer written.
 - Both scripts skip sessions that already have a `dff.npy` unless `overwrite: true`.
 

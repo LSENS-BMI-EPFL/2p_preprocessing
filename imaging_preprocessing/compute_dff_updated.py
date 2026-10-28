@@ -1,10 +1,13 @@
 import argparse
+import glob
 import os
 import sys
 import time
 import scipy
 import numpy as np
 import pandas as pd
+import tifffile
+import yaml
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -523,6 +526,147 @@ def plot_dff_check(F_raw, F_neu, F_cor, F0, dff, fs, save_path, cells, metrics=N
     plt.close(fig)
 
 
+def get_tif_starting_frames(reg_tif_folder, n_files, ops):
+    '''
+    Index of the first frame of each registered tif (natsorted) in reg_tif.
+    From movie_specs.yaml (written by the NWB conversion) if present. Otherwise
+    suite2p writes one tif per registration batch, so the files start every
+    batch_size frames.
+    '''
+    specs_path = os.path.join(reg_tif_folder, 'movie_specs.yaml')
+    if os.path.exists(specs_path):
+        with open(specs_path, 'r', encoding='utf8') as fh:
+            starts = yaml.safe_load(fh)['starting frames']
+        source = 'movie_specs.yaml'
+    else:
+        reg = ops.get('registration')
+        batch_size = reg['batch_size'] if isinstance(reg, dict) and 'batch_size' in reg else ops['batch_size']
+        starts = list(range(0, ops['nframes'], batch_size))
+        source = f'ops batch_size ({batch_size})'
+    if len(starts) != n_files:
+        raise ValueError(f'{len(starts)} starting frames from {source} for {n_files} tif files in {reg_tif_folder}.')
+    return np.asarray(starts), source
+
+
+def read_frames(tif_files, starts, first, last):
+    # Frames [first, last) of the registered movie, read across tif files.
+    chunks = []
+    for i in range(np.searchsorted(starts, first, side='right') - 1, len(tif_files)):
+        if starts[i] >= last:
+            break
+        with tifffile.TiffFile(tif_files[i]) as tif:
+            n_pages = starts[i + 1] - starts[i] if i + 1 < len(starts) else len(tif.pages)
+            a, b = max(first, starts[i]) - starts[i], min(last - starts[i], n_pages)
+            chunks.append(tif.asarray(key=range(a, b)).reshape(b - a, *tif.pages[0].shape))
+    movie = np.concatenate(chunks)
+    if movie.shape[0] != last - first:
+        raise ValueError(f'Read {movie.shape[0]} frames for frames {first}-{last}.')
+    return movie
+
+
+def select_movement_clips(motion, ratio, fs, n_clips, t_before=1.5, t_after=1.5, max_frames=300):
+    '''
+    Clips around motion periods (motion: bool per frame). Each clip starts
+    t_before s before a period and ends t_after s after it, at most max_frames
+    long (periods too long for that are cut, and only used if there are not
+    enough short ones). Periods are ranked by depth (lowest corrXY / local
+    median) and n_clips are taken evenly along that ranking, from the strongest
+    to the mildest, without overlapping clips.
+    '''
+    n = motion.size
+    before, after = int(round(t_before * fs)), int(round(t_after * fs))
+    labels, _ = scipy.ndimage.label(motion)
+    candidates = []
+    for s in scipy.ndimage.find_objects(labels):
+        p0, p1 = s[0].start, s[0].stop
+        c0 = max(0, p0 - before)
+        candidates.append({'start_frame': c0, 'stop_frame': min(n, p1 + after, c0 + max_frames),
+                           'artifact_start_frame': p0, 'artifact_stop_frame': p1, 'depth': ratio[p0:p1].min(),
+                           'fits': p1 + after - c0 <= max_frames})
+    # Periods shown whole first, each group from the strongest to the mildest.
+    candidates.sort(key=lambda c: (not c['fits'], c['depth']))
+    n_fit = sum(c['fits'] for c in candidates)
+    pool = candidates[:n_fit] if n_fit >= n_clips else candidates
+
+    chosen = []
+    for target in np.unique(np.linspace(0, len(pool) - 1, min(n_clips, len(pool))).round().astype(int)):
+        # First candidate from target on whose clip doesn't overlap an earlier one.
+        for c in pool[target:] + pool[:target]:
+            if c not in chosen and all(c['stop_frame'] <= o['start_frame'] or c['start_frame'] >= o['stop_frame']
+                                       for o in chosen):
+                chosen.append(c)
+                break
+    return sorted(chosen, key=lambda c: c['start_frame'])
+
+
+def select_stable_clips(bad_frames, ratio, fs, n_clips, t_before=1.5, t_after=1.5, max_frames=300):
+    '''
+    max_frames clips with no artifact frame within them or t_before / t_after s
+    around them. The session is split in n_clips equal parts and the clip with
+    the highest mean corrXY / local median is taken in each.
+    '''
+    n = bad_frames.size
+    before, after = int(round(t_before * fs)), int(round(t_after * fs))
+    # A clip starting at s is clean if there is no bad frame in [s - before, s + max_frames + after).
+    csum = np.r_[0, np.cumsum(bad_frames)]
+    starts = np.arange(0, n - max_frames + 1)
+    clean = csum[np.minimum(n, starts + max_frames + after)] - csum[np.maximum(0, starts - before)] == 0
+    rsum = np.r_[0, np.cumsum(ratio)]
+    score = (rsum[starts + max_frames] - rsum[starts]) / max_frames
+
+    chosen = []
+    for part in np.array_split(starts, n_clips):
+        # Clips end inside their part, so clips of adjacent parts don't overlap.
+        ok = part[clean[part] & (part + max_frames <= part[-1] + 1)] if part.size else part
+        if ok.size:
+            s = ok[np.argmax(score[ok])]
+            chosen.append({'start_frame': s, 'stop_frame': s + max_frames, 'depth': ratio[s:s + max_frames].min()})
+    return chosen
+
+
+def save_movie_snippets(suite2p_folder, session_id, ops, corrXY, motion_frames, bad_frames, n_movement=8,
+                        n_stable=2, t_before=1.5, t_after=1.5, max_frames=300, motion_window=20, log=print):
+    '''
+    Short clips of the registered movie (reg_tif) illustrating motion artifacts,
+    saved to <suite2p_folder>/calcium_movie_snippets:
+    <session_id>_movement_example_<i>.tiff around n_movement motion periods
+    (motion_frames) and <session_id>_stable_example_<i>.tiff for n_stable
+    stretches without any artifact frame (bad_frames, brightness steps
+    included). snippets.csv lists the frames of each clip. Previous snippets
+    of the session are replaced.
+    '''
+    reg_tif_folder = os.path.join(suite2p_folder, 'reg_tif')
+    tif_files = natsorted(glob.glob(os.path.join(reg_tif_folder, '*.tif')))
+    if not tif_files:
+        log(f'No registered tifs in {reg_tif_folder}: movie snippets skipped.')
+        return
+    starts, source = get_tif_starting_frames(reg_tif_folder, len(tif_files), ops)
+    fs = ops['fs']
+    ratio = corrXY / scipy.ndimage.median_filter(corrXY, size=int(round(motion_window * fs)) | 1, mode='nearest')
+    kw = dict(t_before=t_before, t_after=t_after, max_frames=max_frames)
+    clips = ([('movement', c) for c in select_movement_clips(motion_frames, ratio, fs, n_movement, **kw)]
+             + [('stable', c) for c in select_stable_clips(bad_frames, ratio, fs, n_stable, **kw)])
+    log(f'Saving {len(clips)} movie snippets from {len(tif_files)} registered tifs (starting frames from {source}).')
+
+    out_folder = os.path.join(suite2p_folder, 'calcium_movie_snippets')
+    os.makedirs(out_folder, exist_ok=True)
+    for old in glob.glob(os.path.join(out_folder, f'{session_id}_*_example_*.tiff')):
+        os.remove(old)
+    rows, counts = [], {'movement': 0, 'stable': 0}
+    for kind, clip in clips:
+        counts[kind] += 1
+        name = f'{session_id}_{kind}_example_{counts[kind]}.tiff'
+        c0, c1 = clip['start_frame'], clip['stop_frame']
+        tifffile.imwrite(os.path.join(out_folder, name), read_frames(tif_files, starts, c0, c1),
+                         metadata={'axes': 'TYX'})
+        rows.append({'file': name, 'kind': kind, 'start_frame': c0, 'stop_frame': c1, 'start_s': c0 / fs,
+                     'artifact_start_frame': clip.get('artifact_start_frame'),
+                     'artifact_stop_frame': clip.get('artifact_stop_frame'),
+                     'min_corrxy_ratio': clip['depth'], 'artifact_frames_in_clip': int(bad_frames[c0:c1].sum())})
+        log(f'  {name}: frames {c0}-{c1} ({c0 / fs:.1f} s), min corrXY / local median {clip["depth"]:.2f}')
+    pd.DataFrame(rows).to_csv(os.path.join(out_folder, 'snippets.csv'), index=False)
+
+
 def find_suite2p_folders(experimenter, mice_ids, haas_path=False,
                          suite2p_subpath=('suite2p', 'plane0'),
                          overwrite=False, paths=None, experimenter_map=None):
@@ -549,7 +693,9 @@ def process_suite2p_folder(suite2p_folder, neuropil_coef=0.7, window=60, percent
                            motion_threshold=0.7, motion_window=20,
                            motion_merge_gap=0.2, motion_pad=0.1, brightness_step_threshold=1.5,
                            example_cells='quality', plot_duration=180,
-                           contamination_threshold=0.8, neuropil_ratio_threshold=0.8):
+                           contamination_threshold=0.8, neuropil_ratio_threshold=0.8,
+                           movie_snippets=True, snippet_n_movement=8, snippet_n_stable=2,
+                           snippet_t_before=1.5, snippet_t_after=1.5, snippet_max_frames=300):
     '''
     Compute and save F_cor, F0, dff, artifact frames, noise metrics and QC
     figures for a single suite2p output folder.
@@ -559,6 +705,8 @@ def process_suite2p_folder(suite2p_folder, neuropil_coef=0.7, window=60, percent
     to window / 2 after each step, where F0 lags). None disables either.
     example_cells: dff_check cells, 'quality' (2 good, 2 median, 2 bad on snr
                    & contamination), 'random' or 'first'.
+    movie_snippets: save registered-movie clips of motion periods and stable
+                    stretches (snippet_* options, see save_movie_snippets).
     '''
     if not os.path.exists(os.path.join(suite2p_folder,'stat.npy')):
         return
@@ -610,6 +758,7 @@ def process_suite2p_folder(suite2p_folder, neuropil_coef=0.7, window=60, percent
             fs=ops['fs'], merge_gap=motion_merge_gap, pad=motion_pad)
         log(f'{n_motion} motion periods (corrXY < {motion_threshold} x local median): {bad_frames.sum()} frames '
             f'({100 * bad_frames.mean():.1f}%)')
+    motion_frames = bad_frames.copy()  # motion only, for the movie snippets
 
     # Whole-FOV brightness steps (immersion water refill): F0 lags for window / 2.
     if brightness_step_threshold is not None:
@@ -687,13 +836,20 @@ def process_suite2p_folder(suite2p_folder, neuropil_coef=0.7, window=60, percent
                              artifacts=bad_frames, fs=ops['fs'],
                              neuropil_coef=neuropil_coef, title=session_id,
                              save_path=os.path.join(suite2p_folder, 'noise_distributions.png'))
+    if movie_snippets and corrXY is not None and motion_threshold is not None:
+        save_movie_snippets(suite2p_folder, session_id, ops, corrXY, motion_frames, bad_frames,
+                            n_movement=snippet_n_movement, n_stable=snippet_n_stable, t_before=snippet_t_before,
+                            t_after=snippet_t_after, max_frames=snippet_max_frames, motion_window=motion_window,
+                            log=log)
     log(f'Done. Data saved: {suite2p_folder}')
 
 
 # Keys of the config's dff_updated: block passed to process_suite2p_folder.
 DFF_PARAMS = ['neuropil_coef', 'window', 'percentile', 'sigma', 'min_f0',
               'motion_threshold', 'motion_window', 'motion_merge_gap', 'motion_pad', 'brightness_step_threshold',
-              'example_cells', 'plot_duration', 'contamination_threshold', 'neuropil_ratio_threshold']
+              'example_cells', 'plot_duration', 'contamination_threshold', 'neuropil_ratio_threshold',
+              'movie_snippets', 'snippet_n_movement', 'snippet_n_stable', 'snippet_t_before', 'snippet_t_after',
+              'snippet_max_frames']
 
 
 def run_from_config(config):
