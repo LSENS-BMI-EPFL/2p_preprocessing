@@ -416,21 +416,45 @@ def quantify(raw_traces, traces, rate, spikes, imaging_rate, save_folder, sessio
                 reached.reindex(np.arange(traces.shape[0])).to_numpy(dtype=float))
 
         if noise_rel is not None:
-            ns_all = [n for n in n_spikes_to_plot]
-            counts = [int((wide.min_detectable_spikes == n).sum()) for n in ns_all]
-            not_reached = int(wide.min_detectable_spikes.isna().sum())
-            fig, ax = plt.subplots(figsize=(1.2 * len(ns_all) + 2.5, 4))
-            labels = [str(n) for n in ns_all] + ['not\nreached']
-            bars = ax.bar(labels, counts + [not_reached], color=['tab:blue'] * len(ns_all) + ['grey'])
-            total = sum(counts) + not_reached
-            for b, c in zip(bars, counts + [not_reached]):
-                ax.annotate(f'{c}\n({100 * c / total:.0f}%)', (b.get_x() + b.get_width() / 2, c), ha='center',
-                            va='bottom', fontsize=8)
-            ax.set_xlabel(f'min_detectable_spikes (isolated-event peak >= {detection_threshold_sd} x noise_rel)')
-            ax.set_ylabel('cells')
-            ax.spines[['top', 'right']].set_visible(False)
-            ax.set_title(f'{session_id} - {total} cells with isolated events (>= {min_events_per_cell} per n)',
-                         fontsize=9)
+            # Every non-excluded cell, per spike count n. Top (cumulative, the min_detectable_spikes <= n filter):
+            # detectable at <= n, else measured at n but below threshold, else < min_events_per_cell isolated
+            # n-spike events. Bottom (strict): measured at n and above / below threshold, or not measured at n.
+            cells = np.flatnonzero(~excluded_cells) if excluded_cells is not None else np.arange(traces.shape[0])
+            mds_all = reached.reindex(cells).to_numpy(dtype=float)
+            panels = {'top': [], 'bottom': []}
+            for n in n_spikes_to_plot:
+                at_n = df[df.n_spikes == n].set_index('cell').peak_over_noise.reindex(cells).to_numpy(dtype=float)
+                measured = ~np.isnan(at_n)
+                above = np.nan_to_num(at_n, nan=-np.inf) >= detection_threshold_sd
+                detected = np.nan_to_num(mds_all, nan=np.inf) <= n
+                panels['top'].append([detected.sum(), (~detected & measured).sum(), (~detected & ~measured).sum()])
+                panels['bottom'].append([above.sum(), (measured & ~above).sum(), (~measured).sum()])
+            labels = [f'>= {detection_threshold_sd} x noise_rel', f'< {detection_threshold_sd} x noise_rel',
+                      f'< {min_events_per_cell} isolated events']
+            colors = ['tab:blue', 'grey', 'lightgrey']
+            x = [str(n) for n in n_spikes_to_plot]
+            fig, axes = plt.subplots(2, 1, figsize=(1.1 * len(x) + 3.5, 7), sharex=True)
+            for ax, key, title in [
+                    (axes[0], 'top', 'cumulative: detectable at <= n spikes (min_detectable_spikes <= n), '
+                                     'else status at n'),
+                    (axes[1], 'bottom', 'strict: isolated n-spike events only')]:
+                vals = np.array(panels[key])
+                bottom = np.zeros(len(x))
+                for k in range(3):
+                    bars = ax.bar(x, vals[:, k], bottom=bottom, color=colors[k], label=labels[k])
+                    for b, v, b0 in zip(bars, vals[:, k], bottom):
+                        if v / len(cells) >= 0.04:
+                            ax.text(b.get_x() + b.get_width() / 2, b0 + v / 2, f'{v}\n({100 * v / len(cells):.0f}%)',
+                                    ha='center', va='center', fontsize=7)
+                    bottom += vals[:, k]
+                ax.set_ylabel('cells')
+                ax.set_title(title, fontsize=9)
+                ax.spines[['top', 'right']].set_visible(False)
+            axes[0].legend(frameon=False, fontsize=8, loc='upper left', bbox_to_anchor=(1, 1))
+            axes[1].set_xlabel('spikes in isolated frame (n)')
+            fig.suptitle(f'{session_id} - {len(cells)} cells (excluded cells left out), peak of the cell average '
+                         f'over >= {min_events_per_cell} isolated events', fontsize=9)
+            fig.tight_layout()
             save_figure(fig, save_folder, 'min_detectable_spikes')
 
         ns = [n for n in n_spikes_to_plot if (df.n_spikes == n).any()]
