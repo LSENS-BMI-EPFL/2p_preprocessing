@@ -59,16 +59,30 @@ def load_corrxy(suite2p_folder, ops):
     return None
 
 
-def get_motion_frames(corrXY, fs, threshold=0.7, window=20):
+def motion_threshold_line(corrXY, fs, threshold=0.7, window=20, min_corr_drop=None):
     '''
-    Frames whose correlation with the registration reference (corrXY) drops
-    below threshold x its rolling median over window (s). Catches uncorrected
-    motion (z-motion, large xy jumps) that suite2p badframes miss: its
-    th_badframes is normalized by the mean shift of the session, so frequent
-    jumps never stand out.
+    corrXY value below which a frame is a motion frame: threshold x its rolling
+    median over window (s), and at least min_corr_drop (absolute corrXY) below
+    that median when given (None: no minimum drop).
     '''
     local = scipy.ndimage.median_filter(corrXY, size=int(round(window * fs)) | 1, mode='nearest')
-    return corrXY < threshold * local
+    line = threshold * local
+    if min_corr_drop is not None:
+        line = np.minimum(line, local - min_corr_drop)
+    return line
+
+
+def get_motion_frames(corrXY, fs, threshold=0.7, window=20, min_corr_drop=None):
+    '''
+    Frames whose correlation with the registration reference (corrXY) drops
+    below threshold x its rolling median over window (s), and by more than
+    min_corr_drop (None: no minimum drop). Catches uncorrected motion
+    (z-motion, large xy jumps) that suite2p badframes miss: its th_badframes is
+    normalized by the mean shift of the session, so frequent jumps never stand
+    out.
+    '''
+    return corrXY < motion_threshold_line(corrXY, fs, threshold=threshold, window=window,
+                                          min_corr_drop=min_corr_drop)
 
 
 def get_brightness_step_frames(F_raw, fs, threshold=1.5, window=60):
@@ -451,14 +465,15 @@ def plot_noise_distributions(metrics, save_path, cells=None, contamination_thres
 
 def plot_dff_check(F_raw, F_neu, F_cor, F0, dff, fs, save_path, cells, metrics=None, bad_frames=None,
                    duration=300, seed=None, cell_labels=None, corrXY=None, motion_threshold=None, motion_window=20,
-                   title=None):
+                   motion_min_corr_drop=None, title=None):
     '''
     Plot F, Fneu, F_cor, F0 (left) and dff (right) for the given cells
     over a random segment of `duration` seconds. If metrics is given, the
     SNR, contamination and motion_r of each cell are written above its dff
     trace. Artifact periods (bad_frames) are shaded. If corrXY is given, it is
     plotted below both columns, with the detection threshold (motion_threshold x
-    rolling median over motion_window s) dashed.
+    rolling median over motion_window s, at least motion_min_corr_drop below
+    it) dashed.
     '''
     rng = np.random.default_rng(seed)
     n = int(round(duration * fs))
@@ -481,14 +496,16 @@ def plot_dff_check(F_raw, F_neu, F_cor, F0, dff, fs, save_path, cells, metrics=N
         # Registration correlation with the reference: drops = motion left after registration.
         threshold = None
         if motion_threshold is not None:
-            local = scipy.ndimage.median_filter(corrXY, size=int(round(motion_window * fs)) | 1, mode='nearest')
-            threshold = motion_threshold * local[sl]
+            threshold = motion_threshold_line(corrXY, fs, threshold=motion_threshold, window=motion_window,
+                                              min_corr_drop=motion_min_corr_drop)[sl]
         for ax in axes[-1]:
             for t0, t1 in artifacts:
                 ax.axvspan(t0, t1, color='#898781', alpha=0.25, lw=0)
             ax.plot(t, corrXY[sl], color='#0b0b0b', lw=0.6, label='corrXY')
             if threshold is not None:
-                ax.plot(t, threshold, color='#e34948', lw=1, ls='--', label=f'{motion_threshold} x local median')
+                ax.plot(t, threshold, color='#e34948', lw=1, ls='--',
+                        label=f'{motion_threshold} x local median'
+                              + (f', drop > {motion_min_corr_drop}' if motion_min_corr_drop is not None else ''))
             ax.set_ylabel('corrXY\n(registration)')
             ax.spines[['top', 'right']].set_visible(False)
         axes[-1, 1].legend(loc='lower right', ncol=2, frameon=False, fontsize=8)
@@ -690,7 +707,7 @@ def find_suite2p_folders(experimenter, mice_ids, haas_path=False,
 
 
 def process_suite2p_folder(suite2p_folder, neuropil_coef=0.7, window=60, percentile=8, sigma=1, min_f0=1,
-                           motion_threshold=0.7, motion_window=20,
+                           motion_threshold=0.7, motion_window=20, motion_min_corr_drop=None,
                            motion_merge_gap=0.2, motion_pad=0.1, brightness_step_threshold=1.5,
                            example_cells='quality', plot_duration=180,
                            contamination_threshold=0.8, neuropil_ratio_threshold=0.8,
@@ -700,7 +717,8 @@ def process_suite2p_folder(suite2p_folder, neuropil_coef=0.7, window=60, percent
     Compute and save F_cor, F0, dff, artifact frames, noise metrics and QC
     figures for a single suite2p output folder.
     Artifact frames = frames where corrXY < motion_threshold x its rolling
-    median over motion_window s (merged motion_merge_gap, padded motion_pad),
+    median over motion_window s and more than motion_min_corr_drop below it
+    (None: no minimum drop; merged motion_merge_gap, padded motion_pad),
     plus whole-FOV brightness steps > brightness_step_threshold x (1 s before
     to window / 2 after each step, where F0 lags). None disables either.
     example_cells: dff_check cells, 'quality' (2 good, 2 median, 2 bad on snr
@@ -754,10 +772,12 @@ def process_suite2p_folder(suite2p_folder, neuropil_coef=0.7, window=60, percent
     elif motion_threshold is not None:
         log('Detecting motion artifacts from corrXY.')
         bad_frames, n_motion = get_artifact_mask(
-            get_motion_frames(corrXY, fs=ops['fs'], threshold=motion_threshold, window=motion_window),
+            get_motion_frames(corrXY, fs=ops['fs'], threshold=motion_threshold, window=motion_window,
+                              min_corr_drop=motion_min_corr_drop),
             fs=ops['fs'], merge_gap=motion_merge_gap, pad=motion_pad)
-        log(f'{n_motion} motion periods (corrXY < {motion_threshold} x local median): {bad_frames.sum()} frames '
-            f'({100 * bad_frames.mean():.1f}%)')
+        drop = f', drop > {motion_min_corr_drop}' if motion_min_corr_drop is not None else ''
+        log(f'{n_motion} motion periods (corrXY < {motion_threshold} x local median{drop}): {bad_frames.sum()} '
+            f'frames ({100 * bad_frames.mean():.1f}%)')
     motion_frames = bad_frames.copy()  # motion only, for the movie snippets
 
     # Whole-FOV brightness steps (immersion water refill): F0 lags for window / 2.
@@ -829,7 +849,8 @@ def process_suite2p_folder(suite2p_folder, neuropil_coef=0.7, window=60, percent
                                               contamination_threshold=contamination_threshold)
     plot_dff_check(F_raw, F_neu, F_cor, F0, dff_masked, fs=ops['fs'], cells=cells, cell_labels=cell_labels,
                    duration=plot_duration, metrics=metrics, corrXY=corrXY, motion_threshold=motion_threshold,
-                   motion_window=motion_window, bad_frames=bad_frames, title=session_id,
+                   motion_window=motion_window, motion_min_corr_drop=motion_min_corr_drop, bad_frames=bad_frames,
+                   title=session_id,
                    save_path=os.path.join(suite2p_folder, 'dff_check.png'))
     plot_noise_distributions(metrics, cells=cells, contamination_threshold=contamination_threshold,
                              neuropil_ratio_threshold=neuropil_ratio_threshold,
@@ -846,7 +867,8 @@ def process_suite2p_folder(suite2p_folder, neuropil_coef=0.7, window=60, percent
 
 # Keys of the config's dff_updated: block passed to process_suite2p_folder.
 DFF_PARAMS = ['neuropil_coef', 'window', 'percentile', 'sigma', 'min_f0',
-              'motion_threshold', 'motion_window', 'motion_merge_gap', 'motion_pad', 'brightness_step_threshold',
+              'motion_threshold', 'motion_window', 'motion_min_corr_drop', 'motion_merge_gap', 'motion_pad',
+              'brightness_step_threshold',
               'example_cells', 'plot_duration', 'contamination_threshold', 'neuropil_ratio_threshold',
               'movie_snippets', 'snippet_n_movement', 'snippet_n_stable', 'snippet_t_before', 'snippet_t_after',
               'snippet_max_frames']

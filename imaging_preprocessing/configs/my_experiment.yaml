@@ -52,6 +52,8 @@ dff_updated:
   # all fall inside these periods.
   motion_threshold: 0.7          # null: no artifact detection
   motion_window: 20              # rolling median window (s)
+  motion_min_corr_drop: 0.005    # motion frames must also be more than this (absolute corrXY) below the rolling
+                                 # median, so tiny drops in low-corrXY sessions are not flagged. Empty: no minimum
   motion_merge_gap: 0.2          # motion frames closer than this (s) form one period
   motion_pad: 0.1                # motion periods extended by this (s) on each side
   brightness_step_threshold: 1.5 # whole-FOV brightness steps above this ratio within 1 s (water refill, PMT
@@ -82,8 +84,8 @@ cascade:
   # (e.g. a clone on the analysis share: /mnt/lsens-analysis/... on HAAS)
   cascade_repo: /mnt/lsens-analysis/Robin_Dard/git_repos/Cascade
   model_name: GC8s_EXC_30Hz_smoothing50ms_causalkernel  # downloaded on first use if missing
-  frame_rate: 30                 # Hz, must match the model (ops.npy is unreadable in the Cascade env)
-  overwrite: false               # true: rerun inference; false: reuse saved predictions (figures always redone)
+  frame_rate: 30                # Hz, must match the model (ops.npy is unreadable in the Cascade env)
+  overwrite: true               # true: rerun inference; false: reuse saved predictions (figures always redone)
   # Quantification figures 
   spike_exclusion_pad: 0         # spikes within this (s) of an artifact frame are left out (0: artifact frames only)
   gap_s: 0.03                    # spiking frames closer than this (s) form one event
